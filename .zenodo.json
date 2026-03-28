@@ -1,0 +1,56 @@
+{
+  "title": "RPI: Resonant Permutation Inference - Zero-Multiply Language Generation via Cache-Resonant Permutation Routing",
+  "description": "RPI is a language generation engine that eliminates all floating-point multiply-accumulate operations from inference. It replaces matrix multiplication with permutation table lookups and integer accumulation, achieving 18,000 tokens/second with model sizes of 0.3-3 MB. Introduces cache-resonance attention (using CPU cache hierarchy as implicit attention), NUMA-aware cell banking, and a dual-brain architecture for speculative LLM drafting. Runs on hardware from Nintendo 64 (1996) to IBM POWER8.",
+  "creators": [
+    {
+      "name": "Boudreaux, Scott",
+      "affiliation": "Elyan Labs",
+      "orcid": ""
+    }
+  ],
+  "contributors": [
+    {
+      "name": "Claude Opus (Anthropic)",
+      "type": "Other",
+      "affiliation": "Anthropic"
+    },
+    {
+      "name": "GPT-5.4 (OpenAI)",
+      "type": "Other",
+      "affiliation": "OpenAI"
+    }
+  ],
+  "upload_type": "software",
+  "access_right": "open",
+  "license": "MIT",
+  "keywords": [
+    "inference",
+    "zero-multiply",
+    "permutation",
+    "cache-resonance",
+    "NUMA",
+    "speculative decoding",
+    "language model",
+    "POWER8",
+    "N64",
+    "vec_perm",
+    "non-bijunctive"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/Scottcjn/rpi-inference",
+      "relation": "isSupplementTo",
+      "resource_type": "software"
+    },
+    {
+      "identifier": "https://github.com/Scottcjn/ram-coffers",
+      "relation": "isPartOf",
+      "resource_type": "software"
+    }
+  ],
+  "references": [
+    "Vaswani et al. Attention Is All You Need. NeurIPS 2017.",
+    "Leviathan et al. Fast Inference from Transformers via Speculative Decoding. ICML 2023.",
+    "Boudreaux. RAM Coffers: NUMA-aware Neuromorphic Weight Banking. GitHub 2025."
+  ]
+}

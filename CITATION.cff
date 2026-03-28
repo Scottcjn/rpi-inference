@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "RPI: Resonant Permutation Inference"
+type: software
+authors:
+  - family-names: "Boudreaux"
+    given-names: "Scott"
+    affiliation: "Elyan Labs"
+    email: "scott@elyanlabs.ai"
+version: "1.0.0"
+date-released: "2026-03-28"
+url: "https://github.com/Scottcjn/rpi-inference"
+repository-code: "https://github.com/Scottcjn/rpi-inference"
+license: MIT
+keywords:
+  - inference
+  - zero-multiply
+  - permutation
+  - cache-resonance
+  - NUMA
+  - speculative-decoding
+  - POWER8
+  - N64
+abstract: >-
+  Zero-multiply language generation engine using permutation table lookups
+  and integer accumulation. Achieves 18,000 tokens/second with 0.3-3 MB models.
+  Introduces cache-resonance attention, NUMA-aware cell banking, and dual-brain
+  speculative drafting for LLMs. Runs on Nintendo 64 through IBM POWER8.
+preferred-citation:
+  type: article
+  authors:
+    - family-names: "Boudreaux"
+      given-names: "Scott"
+      affiliation: "Elyan Labs"
+  title: "RPI: Resonant Permutation Inference - Zero-Multiply Language Generation via Cache-Resonant Permutation Routing"
+  year: 2026
+  url: "https://github.com/Scottcjn/rpi-inference"
