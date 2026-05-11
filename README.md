@@ -259,7 +259,7 @@ Neither. RPI occupies a novel position:
 
 RPI distills an LLM teacher's actual output distribution into permutation tables. The knowledge comes from the LLM. The inference mechanism is novel. It's machine-learned knowledge running on a fundamentally different compute substrate.
 
-The key insight: a Markov chain IS a degenerate case of attention where context window = 1-3 tokens. But when that chain is distilled from a 8B parameter model that has already internalized long-range dependencies, the transition probabilities encode far more than naive n-gram statistics.
+The key insight: a Markov chain IS a degenerate case of attention where context window = 1-3 tokens. But when that chain is distilled from an 8B-parameter model that has already internalized long-range dependencies, the transition probabilities encode far more than naive n-gram statistics.
 
 ## Project Structure
 
