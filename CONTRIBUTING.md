@@ -1,11 +1,11 @@
-# Contributing to [Project Name]
+# Contributing to RPI - Resonant Permutation Inference
 
 Thank you for contributing to this project! Please follow these guidelines to help keep the codebase consistent and the review process smooth.
 
 ## Getting Started
 
 1. **Fork** the repository
-2. **Clone** your fork: `git clone https://github.com/YOUR_USERNAME/REPO_NAME.git`
+2. **Clone** your fork, replacing `YOUR_USERNAME` with your GitHub username: `git clone https://github.com/YOUR_USERNAME/rpi-inference.git`
 3. **Create** a feature branch: `git checkout -b feature/your-feature-name`
 4. **Make** your changes and test them
 5. **Submit** a pull request
