@@ -15,6 +15,7 @@ N_PERM_BLOCKS = 256  # 2 per cell
 N_ROUTES_PER = 4
 N_EMITS_PER = 4
 VOCAB_SIZE = 256     # byte-level for testing
+CELL_SIZE = struct.calcsize('<IIIIIIII HH')
 
 def write_rpi(path):
     n_routes = N_CELLS * N_ROUTES_PER
@@ -24,7 +25,7 @@ def write_rpi(path):
         # Header (128 bytes)
         embed_offset = (128 +                           # header
                         N_BANKS * 32 +                   # banks
-                        N_CELLS * 28 +                   # cells
+                        N_CELLS * CELL_SIZE +            # cells
                         N_PERM_BLOCKS * (RPI_LANES + 8) + # perm blocks
                         n_routes * 8 +                   # routes
                         n_emits * 8)                     # emits
@@ -54,7 +55,7 @@ def write_rpi(path):
                 b'\x00' * 8)
             f.write(bank)
 
-        # Cells (28 bytes each)
+        # Cells
         perm_idx = 0
         route_idx = 0
         emit_idx = 0
