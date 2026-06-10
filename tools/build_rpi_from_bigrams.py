@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """Phase 2: Build .rpi model from saved bigram JSON."""
 import struct, json, os, random
 from collections import Counter

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """
 RPI v14 Model Builder — Beyond Bigrams
 Uses: bigrams + pair-hash trigrams + phrase templates
