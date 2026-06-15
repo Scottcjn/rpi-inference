@@ -248,6 +248,8 @@ Benchmarked on real hardware:
 
 For comparison: llama.cpp on POWER8 with PSE optimizations achieves 147 tok/s for TinyLlama 1.1B prompt processing. RPI achieves similar throughput with a model **1000x smaller**.
 
+For a reproducible ARM vs x86 benchmark protocol and comparison template, see [docs/PERFORMANCE_COMPARISON.md](docs/PERFORMANCE_COMPARISON.md).
+
 ## Is This GOFAI or LLM?
 
 Neither. RPI occupies a novel position:
