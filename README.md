@@ -179,11 +179,33 @@ Result: LLM only fires for ~30-40% of tokens. The rest are served from RPI at ne
 | **x86_64** | Generic C (SSE/AVX planned) | `rdtsc` entropy | Production |
 | **x86 vintage (386+)** | Generic C | Any x86 with integer ALU | Production |
 | **AArch64** | Generic C (NEON `tbl` planned) | `cntvct_el0` entropy | Production |
+| **Raspberry Pi 5** | AArch64 Generic C | BCM2712 / Cortex-A76; NEON `tbl` backend still planned | Expected via AArch64 path; benchmark verification needed |
 | **ARM 32-bit** | Generic C | ARMv6+, Raspberry Pi | Production |
 | **MIPS** | Scalar C | N64 R4300i, zero FPU, 4MB RAM | Production |
 | **RISC-V** | Generic C | RV32/RV64, any variant | Planned |
 | **SPARC** | Generic C | UltraSPARC and up | Planned |
 | **N64 RSP** | Vector microcode | 8x16-bit SIMD lanes | Planned |
+
+### Raspberry Pi Notes
+
+Raspberry Pi 5 uses the Broadcom BCM2712 SoC with 64-bit Cortex-A76 cores. It
+should build through the existing AArch64 generic C path today, while the
+Pi-specific NEON `tbl` fast path remains planned work. Treat Pi 5 throughput,
+thermal behavior, and sustained-clock behavior as hardware-dependent until a
+real-board benchmark is attached.
+
+For a compatibility smoke test on Pi 5 or Pi OS 64-bit, use the same commands as
+the C quick start and include the board model, OS image, compiler, and any
+thermal throttling notes when reporting results:
+
+```bash
+make
+make test
+./rpi-cli -m models/sophia.rpi -p "Who are you?" -n 100
+```
+
+Older Raspberry Pi boards running 32-bit userspace should use the ARM 32-bit
+generic C row above instead of the AArch64 path.
 
 ### N64 Engine
 
