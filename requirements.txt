@@ -1,0 +1,8 @@
+# rpi-inference — Python dependencies
+#
+# The core inference runtime is pure C (src/) operating on the .rpi format and
+# has ZERO third-party dependencies — it runs on N64, POWER8, x86, and ARM with
+# only a C toolchain. The packages below are used ONLY by the optional
+# model-building / distillation tools under tools/ (host-side, build-time).
+numpy>=2.5.0
+transformers>=5.12.1
