@@ -1,4 +1,4 @@
-[![BCOS Certified](https://img.shields.io/badge/BCOS-Certified-brightgreen?style=flat)](BCOS.md)
+[![BCOS Certified](https://rustchain.org/bcos/badge/BCOS-be141bd4.svg)](https://rustchain.org/bcos/verify/BCOS-be141bd4) [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 
 # RPI - Resonant Permutation Inference
 
