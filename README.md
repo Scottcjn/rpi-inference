@@ -310,7 +310,7 @@ rpi-inference/
 ├── docs/
 │   └── DUAL_BRAIN.md       # Dual-brain architecture spec
 ├── Makefile                # Auto-detects platform
-└── LICENSE                 # MIT
+└── LICENSE                 # AGPLv3
 ```
 
 ## Research Context
@@ -336,7 +336,13 @@ RPI represents the extreme end of the efficiency spectrum: what if we remove ALL
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+**AGPLv3** (open-core dual license). `rpi-inference` is free and open under the
+[GNU AGPLv3](LICENSE); under AGPLv3 §13, network/SaaS use requires sharing your
+corresponding source. For closed-source integration, embedded/OEM/firmware shipping,
+or a hosted service without publishing your backend, a **commercial license** is
+available — see [COMMERCIAL.md](COMMERCIAL.md).
+
+Copyright © 2026 Scott Boudreaux / Elyan Labs.
 
 ---
 

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT
+/* SPDX-License-Identifier: AGPL-3.0-or-later
  * decode.c — RPI inference engine (the heart of it)
  *
  * This is the llama.cpp equivalent for Resonant Permutation Inference.

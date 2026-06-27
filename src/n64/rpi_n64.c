@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT
+/* SPDX-License-Identifier: AGPL-3.0-or-later
  * rpi_n64.c — RPI inference for N64 MIPS R4300i
  *
  * Zero-multiply inference engine for Legend of Elya.

@@ -44,4 +44,4 @@ pytest --cov=. --cov-report=term-missing
 
 ## License
 
-By submitting a pull request, you agree that your contributions will be licensed under the project's MIT license.
+By submitting a pull request, you agree that your contributions will be licensed under the project's **AGPLv3** license (see [LICENSE](LICENSE)), and that Elyan Labs may also offer your contribution under the project's commercial license (see [COMMERCIAL.md](COMMERCIAL.md)) as part of its open-core dual-licensing model.
