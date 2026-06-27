@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT
+/* SPDX-License-Identifier: AGPL-3.0-or-later
  * rpi_format.h — Resonant Permutation Inference model format
  *
  * .rpi file layout:

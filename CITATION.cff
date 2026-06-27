@@ -12,7 +12,7 @@ date-released: "2026-03-28"
 doi: "10.5281/zenodo.19271983"
 url: "https://github.com/Scottcjn/rpi-inference"
 repository-code: "https://github.com/Scottcjn/rpi-inference"
-license: MIT
+license: AGPL-3.0-or-later
 keywords:
   - inference
   - zero-multiply

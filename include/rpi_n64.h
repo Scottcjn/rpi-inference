@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT
+/* SPDX-License-Identifier: AGPL-3.0-or-later
  * rpi_n64.h — RPI inference for N64
  * Zero-multiply. Table-driven. Sophia speaks through permutations.
  * (c) 2026 Elyan Labs

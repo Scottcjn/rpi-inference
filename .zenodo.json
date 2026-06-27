@@ -22,7 +22,7 @@
   ],
   "upload_type": "software",
   "access_right": "open",
-  "license": "MIT",
+  "license": "AGPL-3.0-or-later",
   "keywords": [
     "inference",
     "zero-multiply",

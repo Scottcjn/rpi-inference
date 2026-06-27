@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """
 distill_to_rpi.py — Distill TinyLlama 1.1B into RPI format
 Resonant Permutation Inference model compiler

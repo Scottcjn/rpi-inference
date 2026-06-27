@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: AGPL-3.0-or-later
 # RPI — Resonant Permutation Inference
 # (c) 2026 Elyan Labs
 

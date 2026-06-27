@@ -3,7 +3,7 @@
 [![BCOS Certified](https://img.shields.io/badge/BCOS-Certified-brightgreen?style=flat)](https://rustchain.org/bcos/)
 
 This repository targets certification under the **Beacon Certified Open Source
-(BCOS)** program by [Elyan Labs](https://elyanlabs.ai). License: `MIT`.
+(BCOS)** program by [Elyan Labs](https://elyanlabs.ai). License: `AGPL-3.0-or-later`.
 
 ## Verification
 ```bash

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT
+/* SPDX-License-Identifier: AGPL-3.0-or-later
  * perm_vsx.c — POWER8 VSX permutation backend for RPI
  *
  * Uses vec_perm (vperm) for zero-multiply inference.
