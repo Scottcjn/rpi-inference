@@ -87,8 +87,16 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Generate */
-    uint32_t output_ids[8192];
+    /* Generate. Heap-allocate sized to the request so large -n cannot overflow
+     * a fixed stack buffer (the old uint32_t output_ids[8192] crashed for
+     * -n > 8192). */
+    if (max_tokens == 0) max_tokens = 1;
+    uint32_t *output_ids = (uint32_t *)malloc((size_t)max_tokens * sizeof(uint32_t));
+    if (!output_ids) {
+        fprintf(stderr, "Error: cannot allocate output buffer for %u tokens\n", max_tokens);
+        rpi_model_free(&model);
+        return 1;
+    }
     uint32_t n_output = 0;
 
     fprintf(stderr, "[RPI] Generating %u tokens...\n\n", max_tokens);
@@ -117,6 +125,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[RPI] Active cells: %u / %u max\n",
             st.n_active, model.hdr.max_active);
 
+    free(output_ids);
     rpi_model_free(&model);
     return 0;
 }

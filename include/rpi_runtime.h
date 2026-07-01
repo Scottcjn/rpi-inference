@@ -18,6 +18,9 @@
 
 #define RPI_MAX_ACTIVE_CELLS  128
 #define RPI_MAX_VOCAB         65536
+/* Upper bound on distinct tokens scored in one emit step: every active cell can
+ * emit at most RPI_MAX_EMITS tokens. Used for sparse (touched-only) scoring. */
+#define RPI_MAX_TOUCHED       (RPI_MAX_ACTIVE_CELLS * RPI_MAX_EMITS)
 
 /* ── Hardware Profile ───────────────────────────────────── */
 typedef struct {
@@ -49,8 +52,11 @@ typedef struct {
     uint32_t round;                 /* current round within token */
     uint32_t total_tokens;          /* tokens generated so far */
 
-    /* Token scoring */
+    /* Token scoring. tok_scores keeps the invariant: an entry is nonzero only
+     * if its id is in touched[] this step; all others read 0 (lazy-cleared). */
     int32_t  tok_scores[RPI_MAX_VOCAB];
+    uint32_t touched[RPI_MAX_TOUCHED];  /* token ids written this/last emit step */
+    uint32_t n_touched;                 /* count of the above (may hold dups) */
     uint32_t last_token;
 
     /* Timing */

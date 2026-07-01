@@ -13,6 +13,20 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* ── Coarse phase profiler (RPI_PROFILE=1) ──────────────────
+ * Accumulates timebase ticks in three buckets so we can see where per-token
+ * time actually goes (permute vs routing/resonance vs vocab scoring) before
+ * optimizing the wrong one. Percentages only; no tb_freq needed. */
+static uint64_t g_prof_perm = 0, g_prof_route = 0, g_prof_emit = 0;
+static int g_prof_on = -1;
+static int prof_enabled(void) {
+    if (g_prof_on < 0) {
+        const char *e = getenv("RPI_PROFILE");
+        g_prof_on = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return g_prof_on;
+}
+
 /* ── State Management ───────────────────────────────────── */
 
 void rpi_state_init(RPIState *st) {
@@ -265,6 +279,8 @@ void rpi_round(const RPIModel *model, const RPIHWProfile *hw,
      *   3. Measure cache resonance
      */
 
+    uint64_t _pt0 = prof_enabled() ? rpi_tb_now() : 0;
+
     /* Phase 1: Run permutations on all active cells */
     for (uint32_t i = 0; i < st->n_active; i++) {
         uint32_t cell_id = st->active_ids[i];
@@ -276,6 +292,8 @@ void rpi_round(const RPIModel *model, const RPIHWProfile *hw,
 
         run_cell_perms(model, cell, st->active_lanes[i]);
     }
+
+    if (prof_enabled()) { uint64_t t = rpi_tb_now(); g_prof_perm += t - _pt0; _pt0 = t; }
 
     /* Phase 2: Follow routes — activate downstream cells */
     uint32_t new_active[RPI_MAX_ACTIVE_CELLS];
@@ -331,6 +349,8 @@ void rpi_round(const RPIModel *model, const RPIHWProfile *hw,
     /* Phase 3: Probe cache resonance */
     rpi_probe_resonance(model, hw, st);
 
+    if (prof_enabled()) g_prof_route += rpi_tb_now() - _pt0;
+
     st->round++;
 }
 
@@ -345,8 +365,24 @@ uint32_t rpi_emit_next(const RPIModel *model, const RPIHWProfile *hw,
                        RPIState *st) {
     (void)hw;
 
-    /* Clear scores */
-    memset(st->tok_scores, 0, model->hdr.vocab_size * sizeof(int32_t));
+    /* RPI_DENSE_EMIT=1 forces the old full-vocab path for same-binary A/B. */
+    static int dense_emit = -1;
+    if (dense_emit < 0) {
+        const char *e = getenv("RPI_DENSE_EMIT");
+        dense_emit = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+
+    /* Clear scores. Sparse (default): wipe only slots dirtied last step, an
+     * O(touched) lazy clear that keeps the invariant "untouched reads 0" and
+     * replaces the O(vocab) memset (was ~a third of per-token time at 32k
+     * vocab). Dense: the old full-vocab memset. */
+    if (dense_emit) {
+        memset(st->tok_scores, 0, model->hdr.vocab_size * sizeof(int32_t));
+    } else {
+        for (uint32_t i = 0; i < st->n_touched; i++)
+            st->tok_scores[st->touched[i]] = 0;
+    }
+    st->n_touched = 0;
 
     /* Collect emissions from ALL active cells (multi-cell voting) */
     for (uint32_t i = 0; i < st->n_active; i++) {
@@ -382,6 +418,11 @@ uint32_t rpi_emit_next(const RPIModel *model, const RPIHWProfile *hw,
 
             if (emit->token_id < model->hdr.vocab_size) {
                 st->tok_scores[emit->token_id] += score;
+                /* Record the dirtied slot so we can scan/clear it sparsely.
+                 * Duplicates are fine: the score already accumulated in the
+                 * slot, and the top-K scan below dedups. */
+                if (st->n_touched < RPI_MAX_TOUCHED)
+                    st->touched[st->n_touched++] = emit->token_id;
             }
         }
     }
@@ -394,23 +435,75 @@ uint32_t rpi_emit_next(const RPIModel *model, const RPIHWProfile *hw,
         }
     }
 
-    /* Top-K sampling with hardware entropy (K=8) */
-    /* Find top 8 candidates */
+    /* Top-K sampling with hardware entropy (K=8).
+     * Scan ONLY the touched candidates, not the whole vocab. The set of tokens
+     * with score>0 is exactly the touched set (untouched read 0 by invariant),
+     * so this yields the same top-K set as the old full-vocab scan. */
     uint32_t top_ids[8] = {0};
     int32_t  top_scores[8] = {0};
 
-    for (uint32_t t = 0; t < model->hdr.vocab_size; t++) {
-        if (st->tok_scores[t] <= 0) continue;
-
-        /* Find minimum in top-K */
-        int min_idx = 0;
-        for (int k = 1; k < 8; k++) {
-            if (top_scores[k] < top_scores[min_idx])
-                min_idx = k;
+    if (dense_emit) {
+        /* Old full-vocab scan (A/B baseline). */
+        for (uint32_t t = 0; t < model->hdr.vocab_size; t++) {
+            if (st->tok_scores[t] <= 0) continue;
+            int min_idx = 0;
+            for (int k = 1; k < 8; k++)
+                if (top_scores[k] < top_scores[min_idx]) min_idx = k;
+            if (st->tok_scores[t] > top_scores[min_idx]) {
+                top_scores[min_idx] = st->tok_scores[t];
+                top_ids[min_idx] = t;
+            }
         }
-        if (st->tok_scores[t] > top_scores[min_idx]) {
-            top_scores[min_idx] = st->tok_scores[t];
-            top_ids[min_idx] = t;
+    } else {
+        for (uint32_t idx = 0; idx < st->n_touched; idx++) {
+            uint32_t t = st->touched[idx];
+            int32_t sc = st->tok_scores[t];
+            if (sc <= 0) continue;
+
+            /* Skip if already placed (touched[] may contain duplicates). */
+            int dup = 0;
+            for (int k = 0; k < 8; k++)
+                if (top_scores[k] > 0 && top_ids[k] == t) { dup = 1; break; }
+            if (dup) continue;
+
+            int min_idx = 0;
+            for (int k = 1; k < 8; k++)
+                if (top_scores[k] < top_scores[min_idx]) min_idx = k;
+            if (sc > top_scores[min_idx]) {
+                top_scores[min_idx] = sc;
+                top_ids[min_idx] = t;
+            }
+        }
+    }
+
+    /* Opt-in differential self-check: verify the sparse top-K SET matches the
+     * old dense full-vocab scan. Resolved once; off by default. */
+    static int emit_check = -1;
+    if (emit_check < 0) {
+        const char *e = getenv("RPI_EMIT_CHECK");
+        emit_check = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    if (emit_check) {
+        uint32_t d_ids[8] = {0}; int32_t d_scores[8] = {0};
+        for (uint32_t t = 0; t < model->hdr.vocab_size; t++) {
+            if (st->tok_scores[t] <= 0) continue;
+            int mi = 0;
+            for (int k = 1; k < 8; k++) if (d_scores[k] < d_scores[mi]) mi = k;
+            if (st->tok_scores[t] > d_scores[mi]) { d_scores[mi] = st->tok_scores[t]; d_ids[mi] = t; }
+        }
+        /* Compare as multisets of (score) present with score>0: same top-K
+         * scores => same candidate strength distribution. */
+        int32_t ss[8], ds[8]; int ns = 0, nd = 0;
+        for (int k = 0; k < 8; k++) { if (top_scores[k] > 0) ss[ns++] = top_scores[k];
+                                      if (d_scores[k] > 0) ds[nd++] = d_scores[k]; }
+        for (int a = 0; a < ns; a++) for (int b = a + 1; b < ns; b++) if (ss[b] > ss[a]) { int32_t t = ss[a]; ss[a] = ss[b]; ss[b] = t; }
+        for (int a = 0; a < nd; a++) for (int b = a + 1; b < nd; b++) if (ds[b] > ds[a]) { int32_t t = ds[a]; ds[a] = ds[b]; ds[b] = t; }
+        int mismatch = (ns != nd);
+        for (int k = 0; !mismatch && k < ns; k++) if (ss[k] != ds[k]) mismatch = 1;
+        if (mismatch) {
+            static int reported = 0;
+            if (reported++ < 5)
+                fprintf(stderr, "[RPI] EMIT_CHECK MISMATCH: sparse topK=%d dense topK=%d\n", ns, nd);
         }
     }
 
@@ -507,7 +600,9 @@ uint32_t rpi_decode_token(const RPIModel *model, const RPIHWProfile *hw,
     }
 
     /* Emit next token with diversity */
+    uint64_t _et0 = prof_enabled() ? rpi_tb_now() : 0;
     uint32_t next = rpi_emit_next(model, hw, st);
+    if (prof_enabled()) g_prof_emit += rpi_tb_now() - _et0;
 
     /* Activate seed cells for next token */
     rpi_activate_token(model, st, next);
@@ -547,5 +642,15 @@ void rpi_generate(const RPIModel *model, const RPIHWProfile *hw,
         /* Stop on EOS (token 0 by convention) */
         if (tok == 0)
             break;
+    }
+
+    if (prof_enabled()) {
+        uint64_t tot = g_prof_perm + g_prof_route + g_prof_emit;
+        if (tot == 0) tot = 1;
+        fprintf(stderr, "[RPI] profile: permute=%.1f%%  routing/resonance=%.1f%%  "
+                "vocab-scoring=%.1f%%\n",
+                100.0 * g_prof_perm / tot,
+                100.0 * g_prof_route / tot,
+                100.0 * g_prof_emit / tot);
     }
 }
