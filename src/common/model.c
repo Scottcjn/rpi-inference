@@ -82,6 +82,11 @@ int rpi_model_load(RPIModel *model, const char *path) {
 }
 
 void rpi_model_free(RPIModel *model) {
+#if defined(__aarch64__)
+    /* Drop any NEON control table keyed on this model's block array before the
+     * backing memory goes away (prevents a stale-pointer ABA match on reload). */
+    rpi_neon_reset();
+#endif
     if (model->raw && model->raw != MAP_FAILED) {
         munmap(model->raw, model->raw_size);
     }

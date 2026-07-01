@@ -119,6 +119,17 @@ void rpi_run_perm_block_altivec(const RPIPermBlock *block,
                                 const int16_t *in, int16_t *out);
 #endif
 
+/* ARM64 NEON (tbl) — AArch64 only (vqtbl4q_u8 is the 64-bit TBL form) */
+#if defined(__aarch64__)
+void rpi_run_perm_block_neon(const RPIPermBlock *block,
+                             const int16_t *in, int16_t *out);
+/* Precompute TBL control vectors for all blocks once (keeps the hot path
+ * pure-vector). Safe to call repeatedly; a no-op for an already-built set. */
+void rpi_neon_prepare(const RPIPermBlock *blocks, uint32_t n);
+/* Invalidate the prepared table (call when the model is freed). */
+void rpi_neon_reset(void);
+#endif
+
 /* ── Timebase helpers ───────────────────────────────────── */
 static inline uint64_t rpi_tb_now(void) {
 #if defined(__powerpc64__) || defined(__ppc64__)

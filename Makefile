@@ -20,9 +20,20 @@ ifeq ($(findstring ppc,$(UNAME_M)),ppc)
 else ifeq ($(findstring x86_64,$(UNAME_M)),x86_64)
   CFLAGS += -march=native -DRPI_X86
   $(info Building for x86_64)
-else ifeq ($(findstring aarch64,$(UNAME_M)),aarch64)
-  CFLAGS += -march=native -DRPI_ARM64
-  $(info Building for AArch64)
+else ifneq ($(filter arm64 aarch64,$(UNAME_M)),)
+  # macOS reports "arm64", Linux reports "aarch64". NEON tbl is baseline
+  # on AArch64, so no -mfpu is needed; -mcpu just improves scheduling.
+  UNAME_S := $(shell uname -s)
+  ifeq ($(UNAME_S),Darwin)
+    # Overridable: `make ARM_CPU=apple-m2` (or native). apple-m1 is a safe
+    # baseline accepted by older clang and correct on every M-series chip.
+    ARM_CPU ?= apple-m1
+    CFLAGS += -mcpu=$(ARM_CPU) -DRPI_ARM64
+    $(info Building for Apple Silicon (NEON tbl, -mcpu=$(ARM_CPU)))
+  else
+    CFLAGS += -march=native -DRPI_ARM64
+    $(info Building for AArch64 (NEON tbl))
+  endif
 endif
 
 SRCS = src/common/model.c src/common/decode.c src/main.c
@@ -32,6 +43,8 @@ ifeq ($(findstring ppc64,$(UNAME_M)),ppc64)
   SRCS += src/power8/perm_vsx.c
 else ifeq ($(findstring ppc,$(UNAME_M)),ppc)
   SRCS += src/g4/perm_altivec.c
+else ifneq ($(filter arm64 aarch64,$(UNAME_M)),)
+  SRCS += src/arm64/perm_neon.c
 endif
 OBJS = $(SRCS:.c=.o)
 

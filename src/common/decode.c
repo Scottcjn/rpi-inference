@@ -61,6 +61,33 @@ void rpi_hw_detect(RPIHWProfile *hw) {
     hw->lat_l3_ns = 0.0f;
     hw->lat_dram_ns = 80.0f;
     fprintf(stderr, "[RPI] PowerPC G4 detected: AltiVec + 32-byte cache lines\n");
+#elif defined(__aarch64__)
+    /* ARM64 (Apple M-series, Pi 5, Graviton, Cortex...). NEON tbl is baseline.
+     * Read the actual counter frequency instead of assuming one — it varies by
+     * platform (Apple 24 MHz, Pi 5 54 MHz, Graviton differs). Wrong tb_freq
+     * poisons both the decode deadline budget and the tok/s report. */
+    {
+        uint64_t cntfrq = 0;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(cntfrq));
+        hw->tb_freq = cntfrq ? cntfrq : 24000000;
+    }
+    hw->l3_size_kb = 0;          /* no conventional L3 on these parts */
+#ifdef __APPLE__
+    hw->cache_line_bytes = 128;  /* Apple M-series use 128-byte lines */
+    hw->l1_size_kb = 128;        /* M-series P-core L1 data cache */
+    hw->l2_size_kb = 16384;      /* shared L2 (P-cluster) */
+    hw->lat_l1_ns = 0.9f; hw->lat_l2_ns = 3.5f; hw->lat_dram_ns = 45.0f;
+    fprintf(stderr, "[RPI] Apple Silicon detected: NEON tbl, tb_freq=%llu Hz\n",
+            (unsigned long long)hw->tb_freq);
+#else
+    hw->cache_line_bytes = 64;   /* generic AArch64 default */
+    hw->l1_size_kb = 64;
+    hw->l2_size_kb = 512;
+    hw->lat_l1_ns = 1.2f; hw->lat_l2_ns = 4.0f; hw->lat_dram_ns = 60.0f;
+    fprintf(stderr, "[RPI] AArch64 detected: NEON tbl, tb_freq=%llu Hz\n",
+            (unsigned long long)hw->tb_freq);
+#endif
+    hw->lat_l3_ns = 0.0f;
 #else
     hw->tb_freq = 1000000000;    /* assume ~1GHz for rdtsc */
     hw->lat_l1_ns = 1.0f;
@@ -107,13 +134,29 @@ static void run_cell_perms(const RPIModel *model, const RPICell *cell,
     /* Select backend */
     void (*run_block)(const RPIPermBlock *, const int16_t *, int16_t *);
 
+    /* Runtime override for A/B benchmarking: RPI_SCALAR=1 forces the generic
+     * C backend on any platform. Resolved once. */
+    static int force_scalar = -1;
+    if (force_scalar < 0) {
+        const char *e = getenv("RPI_SCALAR");
+        force_scalar = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+
+    if (force_scalar) {
+        run_block = rpi_run_perm_block_c;
+    } else {
 #if defined(__POWER8_VECTOR__)
-    run_block = rpi_run_perm_block_vsx;
+        run_block = rpi_run_perm_block_vsx;
 #elif defined(__ALTIVEC__)
-    run_block = rpi_run_perm_block_altivec;
+        run_block = rpi_run_perm_block_altivec;
+#elif defined(__aarch64__)
+        /* Build the TBL control table once so the hot path stays pure-vector. */
+        rpi_neon_prepare(model->perm_blocks, model->hdr.n_perm_blocks);
+        run_block = rpi_run_perm_block_neon;
 #else
-    run_block = rpi_run_perm_block_c;
+        run_block = rpi_run_perm_block_c;
 #endif
+    }
 
     /* Temporary buffer for ping-pong */
     int16_t tmp[RPI_LANES];
