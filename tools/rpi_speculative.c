@@ -34,7 +34,10 @@
 #include <time.h>
 
 /* ── RPI n-gram drafter (mirrors src/common/decode.c ngram_copy_next) ──
- * Longest suffix (n = 8..1) of the token history that occurred earlier;
+ * CANONICAL COPY LIVES IN src/common/decode.c (ngram_copy_next); if either
+ * side changes, change both or extract a shared header — this function is the
+ * measurement oracle, and drift silently invalidates the numbers.
+ * Longest suffix of the token history that occurred earlier;
  * most recent match wins; the continuation is the draft token. Pure table
  * permutation — no model, no multiply. */
 #define NGRAM_MAX 8
@@ -107,6 +110,10 @@ int main(int argc, char **argv) {
     }
     if (!model_path) { fprintf(stderr, "need -m model.gguf\n"); return 1; }
     if (draft_k < 1) draft_k = 1;
+    if (draft_k > 63) draft_k = 63;   /* d[64]/run[65] capacity — -k 65 was a
+                                         stack overflow (tri-brain catch) */
+    if (n_gen < 1) n_gen = 1;
+    if (n_gen > 3500) n_gen = 3500;   /* keep prompt+gen inside cap/n_ctx */
 
     llama_backend_init();
     struct llama_model_params mp = llama_model_default_params();
@@ -123,17 +130,19 @@ int main(int argc, char **argv) {
     if (!ctx) { fprintf(stderr, "context init failed\n"); return 1; }
     llama_memory_t mem = llama_get_memory(ctx);
 
-    /* history buffer: prompt + generated */
-    int cap = 4096;
+    /* history buffer: prompt + generated. cap == n_ctx (cp.n_ctx below is
+     * set from this) so the loop guard and the KV limit cannot drift apart. */
+    const int cap = 4096;
     llama_token *hist = malloc(sizeof(llama_token) * cap);
+    if (!hist) { fprintf(stderr, "oom\n"); return 1; }
     /* saved logits row: on a rejection we keep the last ACCEPTED position's
      * logits here instead of paying a whole re-decode for them. */
     float *saved_logits = malloc(sizeof(float) * n_vocab);
+    if (!saved_logits) { fprintf(stderr, "oom\n"); return 1; }
     int have_saved = 0;
     int T = llama_tokenize(vocab, prompt, (int)strlen(prompt),
                            hist, cap, /*add_special=*/1, /*parse_special=*/1);
     if (T <= 0) { fprintf(stderr, "tokenize failed (%d)\n", T); return 1; }
-    const int prompt_len = T;
 
     /* ingest prompt, logits on last */
     if (decode_run(ctx, hist, T, 0, 0)) { fprintf(stderr, "prompt decode failed\n"); return 1; }
@@ -234,6 +243,9 @@ int main(int argc, char **argv) {
             k_cur = (a > 1) ? a : 1;
         }
     }
+    if (generated < n_gen && T + draft_k + 1 >= cap)
+        fprintf(stderr, "[rpi-spec] warning: stopped at context cap "
+                "(%d tokens generated of %d requested)\n", generated, n_gen);
     double dt = now_s() - t0;
 
     if (show_text) printf("\n");
@@ -245,7 +257,6 @@ int main(int argc, char **argv) {
             generated > 0 ? (double)accepted_draft / generated : 0,
             fwd_calls > 0 ? (double)generated / fwd_calls : 0);
 
-    (void)prompt_len;
     free(hist);
     free(saved_logits);
     llama_free(ctx);
