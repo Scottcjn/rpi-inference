@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT
+/* SPDX-License-Identifier: AGPL-3.0-or-later
  * perm_neon.c — ARM64 NEON permutation backend for RPI
  *
  * The AArch64 answer to POWER's vec_perm is TBL (vqtbl): a byte-wise

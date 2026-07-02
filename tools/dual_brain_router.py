@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """dual_brain_router.py — the local agent that decides RPI vs LLM.
 
 The dual-brain hook: a router that polls the small permutation engine (RPI,

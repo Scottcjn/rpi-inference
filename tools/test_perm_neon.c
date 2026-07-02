@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT
+/* SPDX-License-Identifier: AGPL-3.0-or-later
  * test_perm_neon.c — differential correctness + microbenchmark for the
  * ARM64 NEON permutation backend.
  *

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT
+/* SPDX-License-Identifier: AGPL-3.0-or-later
  * rpi_speculative.c — RPI n-gram drafting inside a real llama.cpp verify loop.
  *
  * True speculative decoding with logit teacher-forcing: the RPI drafter
