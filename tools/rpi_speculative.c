@@ -34,6 +34,14 @@
  *   CUDA   RTX 4070 Laptop     2.71x / 1.01x   (Qwen2.5-7B — bigger verifier,
  *                                               bigger win, as the economics say)
  *   Vulkan AMD Radeon 780M     1.95x / 1.04x   (TinyLlama-1.1B)
+ *   CUDA   Tesla M40 (2015!)   1.89x / 0.91x   (TinyLlama-1.1B; 7B loses on
+ *                                               Maxwell — batch too costly)
+ *   CUDA   Tesla V100-SXM2     3.63x / 0.93x   (TinyLlama-1.1B, 746 tok/s)
+ *   CUDA   Tesla V100-SXM2     1.98x / 0.91x   (Qwen2.5-7B, card shared with
+ *                                               a live server)
+ * NOTE: CUDA enumerates devices fastest-first by default, so nvidia-smi index
+ * != CUDA index on mixed boxes (CUDA_VISIBLE_DEVICES=1 picked the M40 on a
+ * V100+M40 machine).
  *
  * (c) 2026 Elyan Labs
  */
