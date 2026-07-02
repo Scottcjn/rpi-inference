@@ -134,6 +134,10 @@ void rpi_run_perm_block_neon(const RPIPermBlock *block,
 void rpi_neon_prepare(const RPIPermBlock *blocks, uint32_t n);
 /* Invalidate the prepared table (call when the model is freed). */
 void rpi_neon_reset(void);
+/* Write-variant: out[i] = ±in[src] (no accumulate). In-place safe (out may
+ * alias in) — the kernel loads all input into registers before storing. */
+void rpi_run_perm_block_neon_write(const RPIPermBlock *block,
+                                   const int16_t *in, int16_t *out);
 #endif
 
 /* ── Timebase helpers ───────────────────────────────────── */

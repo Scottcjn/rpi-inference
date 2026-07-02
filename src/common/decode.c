@@ -13,11 +13,40 @@
 #include <string.h>
 #include <stdlib.h>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+/* Lane energy (L1 norm of the 64 int16 lanes). Used for routing decisions and
+ * emission strength. NEON version is BIT-EXACT vs the scalar loop: vabal_s16
+ * against zero computes |v| widened to s32 before accumulating, so even
+ * INT16_MIN contributes exactly 32768. */
+static inline int32_t rpi_lane_energy(const int16_t *lanes) {
+#if defined(__aarch64__)
+    int32x4_t acc = vdupq_n_s32(0);
+    int16x4_t zero = vdup_n_s16(0);
+    for (int j = 0; j < RPI_LANES; j += 8) {
+        int16x8_t v = vld1q_s16(lanes + j);
+        acc = vabal_s16(acc, vget_low_s16(v), zero);
+        acc = vabal_s16(acc, vget_high_s16(v), zero);
+    }
+    return vaddvq_s32(acc);
+#else
+    int32_t energy = 0;
+    for (int j = 0; j < RPI_LANES; j++) {
+        int16_t v = lanes[j];
+        energy += (v >= 0) ? v : -v;
+    }
+    return energy;
+#endif
+}
+
 /* ── Coarse phase profiler (RPI_PROFILE=1) ──────────────────
  * Accumulates timebase ticks in three buckets so we can see where per-token
  * time actually goes (permute vs routing/resonance vs vocab scoring) before
  * optimizing the wrong one. Percentages only; no tb_freq needed. */
 static uint64_t g_prof_perm = 0, g_prof_route = 0, g_prof_reson = 0, g_prof_emit = 0;
+static uint64_t g_prof_wall0 = 0;   /* generation start, for coverage */
 static int g_prof_on = -1;
 static int prof_enabled(void) {
     if (g_prof_on < 0) {
@@ -172,6 +201,26 @@ static void run_cell_perms(const RPIModel *model, const RPICell *cell,
 #endif
     }
 
+#if defined(__aarch64__)
+    /* NEON fast path: the write-variant kernel (out = ±in[src], no accumulate)
+     * is arithmetically identical to memset+accumulate and is in-place safe
+     * (all input loaded to registers before any store). So run each block
+     * directly lanes -> lanes: no tmp, no 128B memset, no 128B memcpy per
+     * block. RPI_OLD_PERM=1 keeps the old ping-pong for same-binary A/B. */
+    static int old_perm = -1;
+    if (old_perm < 0) {
+        const char *e = getenv("RPI_OLD_PERM");
+        old_perm = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    if (!force_scalar && !old_perm) {
+        for (uint32_t b = 0; b < cell->perm_block_count; b++) {
+            const RPIPermBlock *block = &model->perm_blocks[cell->perm_block_start + b];
+            rpi_run_perm_block_neon_write(block, lanes, lanes);
+        }
+        return;
+    }
+#endif
+
     /* Temporary buffer for ping-pong */
     int16_t tmp[RPI_LANES];
 
@@ -319,11 +368,7 @@ void rpi_round(const RPIModel *model, const RPIHWProfile *hw,
         n_new = st->n_active;
 
         for (uint32_t i = 0; i < st->n_active; i++) {
-            int32_t energy = 0;
-            for (int j = 0; j < RPI_LANES; j++) {
-                int16_t v = st->active_lanes[i][j];
-                energy += (v >= 0) ? v : -v;
-            }
+            int32_t energy = rpi_lane_energy(st->active_lanes[i]);
             if (energy < 64 * 10) continue;
 
             const RPICell *cell = &model->cells[st->active_ids[i]];
@@ -361,11 +406,7 @@ void rpi_round(const RPIModel *model, const RPIHWProfile *hw,
 
         uint32_t orig_active = st->n_active;
         for (uint32_t i = 0; i < orig_active; i++) {
-            int32_t energy = 0;
-            for (int j = 0; j < RPI_LANES; j++) {
-                int16_t v = st->active_lanes[i][j];
-                energy += (v >= 0) ? v : -v;
-            }
+            int32_t energy = rpi_lane_energy(st->active_lanes[i]);
             if (energy < 64 * 10) continue;
 
             const RPICell *cell = &model->cells[st->active_ids[i]];
@@ -451,11 +492,7 @@ uint32_t rpi_emit_next(const RPIModel *model, const RPIHWProfile *hw,
         const RPICell *cell = &model->cells[cell_id];
 
         /* Lane energy as cell activation strength */
-        int32_t energy = 0;
-        for (int j = 0; j < RPI_LANES; j++) {
-            int16_t v = st->active_lanes[i][j];
-            energy += (v >= 0) ? v : -v;
-        }
+        int32_t energy = rpi_lane_energy(st->active_lanes[i]);
 
         /* Bank diversity bonus: cells from underrepresented banks score higher */
         int32_t bank_bonus = (cell->bank_id != (st->phase & 3)) ? 50 : 0;
@@ -682,6 +719,8 @@ void rpi_generate(const RPIModel *model, const RPIHWProfile *hw,
                   RPIState *st, const uint32_t *prompt_ids,
                   uint32_t prompt_len, uint32_t max_tokens,
                   uint32_t *output_ids, uint32_t *n_output) {
+    if (prof_enabled()) g_prof_wall0 = rpi_tb_now();
+
     /* Ingest prompt */
     for (uint32_t i = 0; i < prompt_len; i++) {
         rpi_activate_token(model, st, prompt_ids[i]);
@@ -713,5 +752,23 @@ void rpi_generate(const RPIModel *model, const RPIHWProfile *hw,
                 100.0 * g_prof_route / tot,
                 100.0 * g_prof_reson / tot,
                 100.0 * g_prof_emit / tot);
+        /* Coverage: how much of REAL generation time the buckets account for.
+         * Percentages above are shares of the instrumented buckets only; work
+         * outside them (convergence sig hash, token activation, cross-bank
+         * injection, loop overhead) shows up here as "uncounted". */
+        uint64_t wall = rpi_tb_now() - g_prof_wall0;
+        if (wall == 0) wall = 1;
+        double ns_per_tick = (hw->tb_freq > 0) ? 1e9 / (double)hw->tb_freq : 0.0;
+        uint32_t ntok = (*n_output > 0) ? *n_output : 1;
+        fprintf(stderr, "[RPI] profile: buckets cover %.1f%% of wall "
+                "(uncounted %.1f%%); per token: perm=%.0fns route=%.0fns "
+                "reson=%.0fns emit=%.0fns uncounted=%.0fns wall=%.0fns\n",
+                100.0 * tot / wall, 100.0 * (double)(wall - tot) / wall,
+                g_prof_perm * ns_per_tick / ntok,
+                g_prof_route * ns_per_tick / ntok,
+                g_prof_reson * ns_per_tick / ntok,
+                g_prof_emit * ns_per_tick / ntok,
+                (double)(wall - tot) * ns_per_tick / ntok,
+                (double)wall * ns_per_tick / ntok);
     }
 }

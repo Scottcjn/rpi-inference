@@ -88,6 +88,33 @@ int main(void) {
     printf("[correctness] %d random blocks: %s (%d mismatches)\n",
            N, fails ? "FAIL" : "PASS", fails);
 
+    /* ── Write-variant: out = ±in[src] (no accumulate), incl. IN-PLACE ── */
+    int wfails = 0;
+    for (int t = 0; t < 50000; t++) {
+        RPIPermBlock b;
+        int16_t in[RPI_LANES], exp[RPI_LANES], o[RPI_LANES], ip[RPI_LANES];
+        fill_block(&b);
+        for (int i = 0; i < RPI_LANES; i++) in[i] = rnd_lane();
+        for (int i = 0; i < RPI_LANES; i++) {
+            uint8_t s = b.src_idx[i];
+            if (s == 0xFF) exp[i] = 0;
+            else {
+                int16_t v = in[s & 0x3F];
+                exp[i] = (int16_t)(((b.sign_bits >> i) & 1) ? -v : v);
+            }
+        }
+        for (int i = 0; i < RPI_LANES; i++) o[i] = rnd_seed(); /* garbage pre-fill */
+        rpi_run_perm_block_neon_write(&b, in, o);
+        if (memcmp(exp, o, sizeof(exp)) != 0) wfails++;
+        /* In-place: out aliases in. Must still equal exp. */
+        memcpy(ip, in, sizeof(ip));
+        rpi_run_perm_block_neon_write(&b, ip, ip);
+        if (memcmp(exp, ip, sizeof(exp)) != 0) wfails++;
+    }
+    printf("[correctness] write-variant + in-place, 50000 blocks: %s (%d mismatches)\n",
+           wfails ? "FAIL" : "PASS", wfails);
+    fails += wfails;
+
     /* ── Fixed contiguous block set for the prepared fast path ─ */
     const int NB = 4096;      /* working set of blocks */
     const int ITERS = 20000;  /* repeat count */
