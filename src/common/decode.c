@@ -68,6 +68,9 @@ void rpi_state_reset(RPIState *st) {
     st->round = 0;
     st->sig_prev = 0;
     memset(st->tok_scores, 0, sizeof(st->tok_scores));
+    st->n_touched = 0;  /* tok_scores is fully zeroed, so the touched list restarts */
+    memset(st->rep_history, 0, sizeof(st->rep_history));
+    st->rep_pos = 0;    /* reset means reset: no repetition carry-over */
 }
 
 /* ── Hardware Detection ─────────────────────────────────── */

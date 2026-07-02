@@ -3,7 +3,9 @@
 # (c) 2026 Elyan Labs
 
 CC ?= gcc
-CFLAGS = -O3 -Wall -Wextra -I include
+# -pthread in BOTH compile and link: compiling with it sets _REENTRANT /
+# thread-safe libc paths on platforms that need it, not just the link flag.
+CFLAGS = -O3 -Wall -Wextra -I include -pthread
 LDFLAGS = -pthread
 
 # Auto-detect architecture

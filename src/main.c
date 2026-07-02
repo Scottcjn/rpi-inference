@@ -124,14 +124,27 @@ int main(int argc, char **argv) {
      * spawn. */
     if (n_streams > 1) {
         if (n_streams > 64) n_streams = 64;
+        const int n_alloc = n_streams;   /* allocation count; n_streams may be
+                                            reduced later to what actually ran */
 
-        /* Warmup: resolve lazy statics single-threaded. */
+        /* The profiler accumulates in shared globals; under -j its numbers
+         * would be garbage from racing writers. Disable it BEFORE the warmup
+         * resolves the cached toggle. */
+        if (getenv("RPI_PROFILE")) {
+            fprintf(stderr, "[RPI] RPI_PROFILE is single-stream only; "
+                    "disabled for -j %d\n", n_streams);
+            unsetenv("RPI_PROFILE");
+        }
+
+        /* Warmup: resolve lazy statics single-threaded. Buffer is deliberately
+         * larger than the 1 token requested so a future over-write cannot
+         * corrupt the stack. */
         {
             RPIState *wst = (RPIState *)calloc(1, sizeof(RPIState));
-            uint32_t wtok, wn = 0;
+            uint32_t wtok[8], wn = 0;
             if (wst) {
                 rpi_state_init(wst);
-                rpi_generate(&model, &hw, wst, prompt_ids, prompt_len, 1, &wtok, &wn);
+                rpi_generate(&model, &hw, wst, prompt_ids, prompt_len, 1, wtok, &wn);
                 free(wst);
             }
         }
@@ -152,6 +165,9 @@ int main(int argc, char **argv) {
         }
         if (alloc_fail) {
             fprintf(stderr, "Error: allocation failed for %d streams\n", n_streams);
+            if (jobs)
+                for (int s = 0; s < n_alloc; s++) { free(jobs[s].st); free(jobs[s].output_ids); }
+            free(jobs); free(tids);
             rpi_model_free(&model);
             return 1;
         }
@@ -160,11 +176,21 @@ int main(int argc, char **argv) {
                 max_tokens, n_streams);
 
         uint64_t mt0 = rpi_tb_now();
-        for (int s = 0; s < n_streams; s++)
-            pthread_create(&tids[s], NULL, stream_worker, &jobs[s]);
-        for (int s = 0; s < n_streams; s++)
+        /* Join exactly the threads that were created: a failed pthread_create
+         * leaves tids[s] uninitialized and joining it is UB. */
+        int n_started = 0;
+        for (int s = 0; s < n_streams; s++) {
+            if (pthread_create(&tids[s], NULL, stream_worker, &jobs[s]) != 0) {
+                fprintf(stderr, "[RPI] warning: could not start stream %d "
+                        "(running %d)\n", s, n_started);
+                break;
+            }
+            n_started++;
+        }
+        for (int s = 0; s < n_started; s++)
             pthread_join(tids[s], NULL);
         uint64_t mt1 = rpi_tb_now();
+        n_streams = (n_started > 0) ? n_started : 1;  /* report what actually ran */
 
         double el = (double)(mt1 - mt0) / (double)hw.tb_freq;
         uint64_t total_tok = 0;
@@ -182,7 +208,7 @@ int main(int argc, char **argv) {
                 (el > 0) ? total_tok / el : 0,
                 (el > 0) ? total_tok / el / n_streams : 0);
 
-        for (int s = 0; s < n_streams; s++) { free(jobs[s].st); free(jobs[s].output_ids); }
+        for (int s = 0; s < n_alloc; s++) { free(jobs[s].st); free(jobs[s].output_ids); }
         free(jobs); free(tids);
         rpi_model_free(&model);
         return 0;
