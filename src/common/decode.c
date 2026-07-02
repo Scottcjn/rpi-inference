@@ -17,7 +17,7 @@
  * Accumulates timebase ticks in three buckets so we can see where per-token
  * time actually goes (permute vs routing/resonance vs vocab scoring) before
  * optimizing the wrong one. Percentages only; no tb_freq needed. */
-static uint64_t g_prof_perm = 0, g_prof_route = 0, g_prof_emit = 0;
+static uint64_t g_prof_perm = 0, g_prof_route = 0, g_prof_reson = 0, g_prof_emit = 0;
 static int g_prof_on = -1;
 static int prof_enabled(void) {
     if (g_prof_on < 0) {
@@ -295,61 +295,121 @@ void rpi_round(const RPIModel *model, const RPIHWProfile *hw,
 
     if (prof_enabled()) { uint64_t t = rpi_tb_now(); g_prof_perm += t - _pt0; _pt0 = t; }
 
-    /* Phase 2: Follow routes — activate downstream cells */
-    uint32_t new_active[RPI_MAX_ACTIVE_CELLS];
-    int16_t  new_lanes[RPI_MAX_ACTIVE_CELLS][RPI_LANES];
-    uint32_t n_new = 0;
+    /* Phase 2: Follow routes — activate downstream cells.
+     *
+     * RPI_OLD_ROUTE=1 selects the original buffered version (double-copies the
+     * whole lane state into scratch buffers each round). The default routes
+     * IN PLACE: existing cells are untouched, new cells are appended straight
+     * into st->active_ids / st->active_lanes past the original count. Identical
+     * behavior (same dedup over the growing set, same decayed lanes from the
+     * source cell), minus four memcpys and a 16 KB stack buffer per round. */
+    static int old_route = -1;
+    if (old_route < 0) {
+        const char *e = getenv("RPI_OLD_ROUTE");
+        old_route = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
 
-    /* Keep existing active cells */
-    memcpy(new_active, st->active_ids, st->n_active * sizeof(uint32_t));
-    memcpy(new_lanes, st->active_lanes, st->n_active * sizeof(new_lanes[0]));
-    n_new = st->n_active;
+    if (old_route) {
+        uint32_t new_active[RPI_MAX_ACTIVE_CELLS];
+        int16_t  new_lanes[RPI_MAX_ACTIVE_CELLS][RPI_LANES];
+        uint32_t n_new;
 
-    for (uint32_t i = 0; i < st->n_active; i++) {
-        uint32_t cell_id = st->active_ids[i];
-        const RPICell *cell = &model->cells[cell_id];
+        memcpy(new_active, st->active_ids, st->n_active * sizeof(uint32_t));
+        memcpy(new_lanes, st->active_lanes, st->n_active * sizeof(new_lanes[0]));
+        n_new = st->n_active;
 
-        /* Compute lane energy (L1 norm) for routing decisions */
-        int32_t energy = 0;
-        for (int j = 0; j < RPI_LANES; j++) {
-            int16_t v = st->active_lanes[i][j];
-            energy += (v >= 0) ? v : -v;
+        for (uint32_t i = 0; i < st->n_active; i++) {
+            int32_t energy = 0;
+            for (int j = 0; j < RPI_LANES; j++) {
+                int16_t v = st->active_lanes[i][j];
+                energy += (v >= 0) ? v : -v;
+            }
+            if (energy < 64 * 10) continue;
+
+            const RPICell *cell = &model->cells[st->active_ids[i]];
+            for (uint32_t r = 0; r < cell->route_count && r < RPI_MAX_ROUTES; r++) {
+                uint32_t dst = model->routes[cell->route_start + r].dst_cell_id;
+                int found = 0;
+                for (uint32_t k = 0; k < n_new; k++)
+                    if (new_active[k] == dst) { found = 1; break; }
+                if (found || n_new >= model->hdr.max_active) continue;
+                new_active[n_new] = dst;
+                for (int j = 0; j < RPI_LANES; j++)
+                    new_lanes[n_new][j] = st->active_lanes[i][j] >> 2;
+                n_new++;
+            }
+        }
+        st->n_active = n_new;
+        memcpy(st->active_ids, new_active, n_new * sizeof(uint32_t));
+        memcpy(st->active_lanes, new_lanes, n_new * sizeof(new_lanes[0]));
+    } else {
+        /* In-place, with an O(1) hash-set membership check instead of the old
+         * O(n_active) linear "already active?" scan. That scan made routing
+         * O(n_active^2 * routes) per round and dominated per-token time; the
+         * hash set makes it O(n_active * routes). Open addressing, linear
+         * probe; 0xFFFFFFFF marks empty. Sized well above max_active. */
+        #define RPI_SEEN_SZ 512
+        #define RPI_SEEN_MASK (RPI_SEEN_SZ - 1)
+        uint32_t seen[RPI_SEEN_SZ];
+        memset(seen, 0xFF, sizeof(seen));
+        for (uint32_t k = 0; k < st->n_active; k++) {
+            uint32_t id = st->active_ids[k];
+            uint32_t h = (id * 2654435761u) & RPI_SEEN_MASK;
+            while (seen[h] != 0xFFFFFFFFu && seen[h] != id) h = (h + 1) & RPI_SEEN_MASK;
+            seen[h] = id;
         }
 
-        /* Only route from high-energy cells */
-        if (energy < 64 * 10)  /* threshold */
-            continue;
-
-        for (uint32_t r = 0; r < cell->route_count && r < RPI_MAX_ROUTES; r++) {
-            const RPIRoute *route = &model->routes[cell->route_start + r];
-            uint32_t dst = route->dst_cell_id;
-
-            /* Check if already active */
-            int found = 0;
-            for (uint32_t k = 0; k < n_new; k++) {
-                if (new_active[k] == dst) { found = 1; break; }
-            }
-            if (found || n_new >= model->hdr.max_active)
-                continue;
-
-            /* Activate downstream cell with scaled lanes */
-            new_active[n_new] = dst;
+        uint32_t orig_active = st->n_active;
+        for (uint32_t i = 0; i < orig_active; i++) {
+            int32_t energy = 0;
             for (int j = 0; j < RPI_LANES; j++) {
-                new_lanes[n_new][j] = st->active_lanes[i][j] >> 2; /* decay */
+                int16_t v = st->active_lanes[i][j];
+                energy += (v >= 0) ? v : -v;
             }
-            n_new++;
+            if (energy < 64 * 10) continue;
+
+            const RPICell *cell = &model->cells[st->active_ids[i]];
+            for (uint32_t r = 0; r < cell->route_count && r < RPI_MAX_ROUTES; r++) {
+                uint32_t dst = model->routes[cell->route_start + r].dst_cell_id;
+                uint32_t h = (dst * 2654435761u) & RPI_SEEN_MASK;
+                while (seen[h] != 0xFFFFFFFFu && seen[h] != dst) h = (h + 1) & RPI_SEEN_MASK;
+                if (seen[h] == dst || st->n_active >= model->hdr.max_active) continue;
+                uint32_t slot = st->n_active;
+                st->active_ids[slot] = dst;
+                for (int j = 0; j < RPI_LANES; j++)
+                    st->active_lanes[slot][j] = st->active_lanes[i][j] >> 2;
+                st->n_active++;
+                seen[h] = dst;  /* probe stopped at the empty slot for dst */
+            }
         }
     }
 
-    /* Update state */
-    st->n_active = n_new;
-    memcpy(st->active_ids, new_active, n_new * sizeof(uint32_t));
-    memcpy(st->active_lanes, new_lanes, n_new * sizeof(new_lanes[0]));
+    /* Opt-in correctness check (RPI_ROUTE_CHECK=1): the hash-set dedup is
+     * correct iff the active set never contains a duplicate. Scan for dups. */
+    {
+        static int route_check = -1;
+        if (route_check < 0) {
+            const char *e = getenv("RPI_ROUTE_CHECK");
+            route_check = (e && e[0] && e[0] != '0') ? 1 : 0;
+        }
+        if (route_check) {
+            for (uint32_t a = 0; a < st->n_active; a++)
+                for (uint32_t b = a + 1; b < st->n_active; b++)
+                    if (st->active_ids[a] == st->active_ids[b]) {
+                        static int rep = 0;
+                        if (rep++ < 5)
+                            fprintf(stderr, "[RPI] ROUTE_CHECK: duplicate active cell %u\n",
+                                    st->active_ids[a]);
+                    }
+        }
+    }
+
+    if (prof_enabled()) { uint64_t t = rpi_tb_now(); g_prof_route += t - _pt0; _pt0 = t; }
 
     /* Phase 3: Probe cache resonance */
     rpi_probe_resonance(model, hw, st);
 
-    if (prof_enabled()) g_prof_route += rpi_tb_now() - _pt0;
+    if (prof_enabled()) g_prof_reson += rpi_tb_now() - _pt0;
 
     st->round++;
 }
@@ -645,12 +705,13 @@ void rpi_generate(const RPIModel *model, const RPIHWProfile *hw,
     }
 
     if (prof_enabled()) {
-        uint64_t tot = g_prof_perm + g_prof_route + g_prof_emit;
+        uint64_t tot = g_prof_perm + g_prof_route + g_prof_reson + g_prof_emit;
         if (tot == 0) tot = 1;
-        fprintf(stderr, "[RPI] profile: permute=%.1f%%  routing/resonance=%.1f%%  "
-                "vocab-scoring=%.1f%%\n",
+        fprintf(stderr, "[RPI] profile: permute=%.1f%%  routing=%.1f%%  "
+                "resonance=%.1f%%  vocab-scoring=%.1f%%\n",
                 100.0 * g_prof_perm / tot,
                 100.0 * g_prof_route / tot,
+                100.0 * g_prof_reson / tot,
                 100.0 * g_prof_emit / tot);
     }
 }
