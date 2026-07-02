@@ -173,7 +173,10 @@ def acceptance(draft, verify):
         if a != b:
             break
         n += 1
-    denom = max(1, min(len(dt), len(vt)))
+    # Denominator is the VERIFIER's text length: acceptance = how much of the
+    # output we were trying to serve the draft actually covered. min() would
+    # let a short draft score 1.0 by matching only its own length.
+    denom = max(1, len(vt))
     return n / denom, n
 
 # ── Stats persistence ───────────────────────────────────────
@@ -185,6 +188,7 @@ def load_stats():
         return {}
 
 def save_stats(st):
+    st["_metric"] = "char_lcp_over_verifier_len_v2"   # version the semantics
     with open(STATS_PATH, "w") as f:
         json.dump(st, f, indent=2)
 
@@ -195,6 +199,8 @@ def record(st, domain, rate):
     d["mean"] = d["rate_sum"] / d["samples"]
 
 def domain_rate(st, domain):
+    if domain.startswith("_"):
+        return None
     d = st.get(domain)
     if not d or d["samples"] < MIN_SAMPLES:
         return None
@@ -328,6 +334,8 @@ def cmd_stats():
         return
     print(f"\n{'domain':9} {'samples':>7} {'mean accept':>11}  routing")
     for dom, d in sorted(st.items()):
+        if dom.startswith("_"):
+            continue   # metadata (metric version), not a domain
         mean = d.get("mean", 0.0)
         route = ("RPI" if d["samples"] >= MIN_SAMPLES and mean >= ACCEPT_THRESHOLD
                  else "LLM")

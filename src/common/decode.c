@@ -803,9 +803,15 @@ void rpi_generate(const RPIModel *model, const RPIHWProfile *hw,
 
         if (ngram_mode) {
             tok = ngram_copy_next(prompt_ids, prompt_len, output_ids, *n_output);
-            if (tok != UINT32_MAX && tok != 0) {
-                /* Copied continuation. Keep the engine state warm so a later
-                 * fallback token still has context. */
+            if (tok != UINT32_MAX) {
+                /* Copied continuation — DELIBERATELY lightweight. The contract
+                 * of a copy is zero engine compute: no rounds, no emission
+                 * scoring, no repetition history. Only seed-activation + phase
+                 * advance, so a later fallback token still has context. A
+                 * fallback after copies therefore runs on a state no pure-
+                 * engine path produces; that hybrid is the design, not an
+                 * accident. (A copied 0 propagates and stops generation below,
+                 * same as an engine-emitted EOS.) */
                 rpi_activate_token(model, st, tok);
                 st->phase = (st->phase + 1) & 3;
                 st->last_token = tok;
