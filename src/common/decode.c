@@ -734,11 +734,57 @@ uint32_t rpi_decode_token(const RPIModel *model, const RPIHWProfile *hw,
 
 /* ── Generate Text ──────────────────────────────────────── */
 
+/* ── Context-copy drafting (RPI_NGRAM=1) ─────────────────────
+ * RPI as a matmul-free PROCEDURAL accelerator: instead of asking the cell
+ * engine to invent the next token, find the longest suffix of the recent
+ * tokens that already occurred earlier in [prompt + generated] and COPY its
+ * continuation. This is prompt-lookup / n-gram speculative drafting — pure
+ * table permutation, zero multiplies, no model quality required — and it is
+ * the token class (copied spans, boilerplate, structure) where a draft can
+ * actually agree with an LLM verifier. Semantics stay with the LLM; the
+ * reordering-shaped tokens run here.
+ *
+ * hist(i) spans prompt then output. Longest match wins, ties go to the MOST
+ * RECENT occurrence. Returns the continuation token, or UINT32_MAX if no
+ * n-gram of length >= NGRAM_MIN matches. */
+#define NGRAM_MAX 8
+#define NGRAM_MIN 1   /* n=1 (most-recent unigram) rescues structural copies
+                         like JSON keys after a novel value token; llama.cpp's
+                         prompt-lookup allows it for the same reason */
+static uint32_t ngram_copy_next(const uint32_t *prompt_ids, uint32_t prompt_len,
+                                const uint32_t *output_ids, uint32_t n_out) {
+    const uint32_t T = prompt_len + n_out;
+    if (T < NGRAM_MIN + 1) return UINT32_MAX;
+
+#define HIST(i) ((i) < prompt_len ? prompt_ids[(i)] : output_ids[(i) - prompt_len])
+
+    uint32_t nmax = (T - 1 < NGRAM_MAX) ? T - 1 : NGRAM_MAX;
+    for (uint32_t n = nmax; n >= NGRAM_MIN; n--) {
+        /* suffix = HIST(T-n .. T-1); scan for its most recent earlier copy */
+        for (uint32_t p = T - n; p-- > 0; ) {   /* p = candidate match start */
+            uint32_t ok = 1;
+            for (uint32_t j = 0; j < n; j++) {
+                if (HIST(p + j) != HIST(T - n + j)) { ok = 0; break; }
+            }
+            if (ok && p + n < T)
+                return HIST(p + n);             /* the copied continuation */
+        }
+    }
+#undef HIST
+    return UINT32_MAX;
+}
+
 void rpi_generate(const RPIModel *model, const RPIHWProfile *hw,
                   RPIState *st, const uint32_t *prompt_ids,
                   uint32_t prompt_len, uint32_t max_tokens,
                   uint32_t *output_ids, uint32_t *n_output) {
     if (prof_enabled()) g_prof_wall0 = rpi_tb_now();
+
+    static int ngram_mode = -1;
+    if (ngram_mode < 0) {
+        const char *e = getenv("RPI_NGRAM");
+        ngram_mode = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
 
     /* Ingest prompt */
     for (uint32_t i = 0; i < prompt_len; i++) {
@@ -753,7 +799,27 @@ void rpi_generate(const RPIModel *model, const RPIHWProfile *hw,
     /* Generate */
     *n_output = 0;
     for (uint32_t i = 0; i < max_tokens; i++) {
-        uint32_t tok = rpi_decode_token(model, hw, st);
+        uint32_t tok;
+
+        if (ngram_mode) {
+            tok = ngram_copy_next(prompt_ids, prompt_len, output_ids, *n_output);
+            if (tok != UINT32_MAX && tok != 0) {
+                /* Copied continuation. Keep the engine state warm so a later
+                 * fallback token still has context. */
+                rpi_activate_token(model, st, tok);
+                st->phase = (st->phase + 1) & 3;
+                st->last_token = tok;
+                st->total_tokens++;
+            } else {
+                /* No copyable span — this token is not procedural. In a
+                 * dual-brain deployment this is the escalation point; standalone
+                 * we fall back to the cell engine. */
+                tok = rpi_decode_token(model, hw, st);
+            }
+        } else {
+            tok = rpi_decode_token(model, hw, st);
+        }
+
         output_ids[i] = tok;
         (*n_output)++;
 

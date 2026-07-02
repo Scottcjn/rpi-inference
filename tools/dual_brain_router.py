@@ -101,10 +101,16 @@ def detokenize(tokens):
         return json.load(r)["content"]
 
 # ── The three brains ────────────────────────────────────────
-def rpi_draft(prompt_ids, k=DRAFT_K):
-    """Draft k tokens on the RPI engine (greedy). Returns (ids, seconds)."""
+def rpi_draft(prompt_ids, k=DRAFT_K, ngram=True):
+    """Draft k tokens on the RPI engine (greedy). Returns (ids, seconds).
+
+    ngram=True is the PROCEDURAL accelerator mode: context-copy drafting
+    (prompt-lookup) — matmul-free span copying, the lane where a draft can
+    genuinely agree with the verifier. ngram=False is the raw cell engine.
+    """
     ids = ",".join(str(t) for t in prompt_ids)
-    cmd = SSH_BASE + [f"RPI_GREEDY=1 {RPI_CLI} -m {RPI_MODEL} -T '{ids}' -n {k} 2>/dev/null"]
+    env = "RPI_GREEDY=1" + (" RPI_NGRAM=1" if ngram else "")
+    cmd = SSH_BASE + [f"{env} {RPI_CLI} -m {RPI_MODEL} -T '{ids}' -n {k} 2>/dev/null"]
     t0 = time.time()
     out = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     dt = time.time() - t0
@@ -118,7 +124,7 @@ def rpi_draft(prompt_ids, k=DRAFT_K):
 def verifier_greedy(prompt_ids, k=DRAFT_K):
     """Verifier's own greedy continuation, in token space. (ids, seconds)."""
     body = {"prompt": prompt_ids, "n_predict": k, "temperature": 0,
-            "top_k": 1, "cache_prompt": True}
+            "top_k": 1, "cache_prompt": True, "return_tokens": True}
     req = urllib.request.Request(f"{VERIFIER_URL}/completion",
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"})
@@ -127,7 +133,14 @@ def verifier_greedy(prompt_ids, k=DRAFT_K):
         resp = json.load(r)
     dt = time.time() - t0
     toks = resp.get("tokens", [])
-    if not toks:                       # older servers: retokenize the text
+    if not toks:
+        # Retokenizing the text is NOT equivalent — token merges at the
+        # boundary differ from the generation-time stream and poison LCP
+        # acceptance (measured: a perfect copy draft scored 0.00 this way).
+        # Warn loudly rather than silently degrade the metric.
+        print("[verifier] WARNING: server did not return token ids; "
+              "falling back to retokenized text (acceptance may be "
+              "understated at span boundaries)", file=sys.stderr)
         toks = tokenize(resp.get("content", ""))
     return toks[:k], dt
 
@@ -145,13 +158,22 @@ def escalate_llm(prompt: str, n=128):
 
 # ── Acceptance ──────────────────────────────────────────────
 def acceptance(draft, verify):
-    """Longest-common-prefix acceptance rate in token space."""
+    """Longest-common-prefix acceptance in TEXT space.
+
+    Token-space LCP is the wrong judge here: the same characters can take
+    different token paths ("jump"+"s" vs "j"+"umps"), and a generate-only
+    verifier free-runs its own path. Measured example: a draft and verifier
+    that agreed on every character scored 2/12 in token space. What an
+    application consumes is text, so acceptance = character-level LCP over
+    the two detokenized continuations.
+    """
+    dt, vt = detokenize(draft), detokenize(verify)
     n = 0
-    for a, b in zip(draft, verify):
+    for a, b in zip(dt, vt):
         if a != b:
             break
         n += 1
-    denom = max(1, min(len(draft), len(verify)))
+    denom = max(1, min(len(dt), len(vt)))
     return n / denom, n
 
 # ── Stats persistence ───────────────────────────────────────
@@ -179,7 +201,34 @@ def domain_rate(st, domain):
     return d["mean"]
 
 # ── Measurement suite ───────────────────────────────────────
+# Two halves. PROC_* prompts are PROCEDURAL — the continuation is copyable
+# from the context (repetition, structure, boilerplate): the lane RPI is
+# supposed to own via n-gram copy drafting. The rest are open-ended semantic
+# prompts where the honest expectation is that RPI has nothing to offer and
+# the router should route to the LLM. The table this suite produces IS the
+# rpi-vs-llm split, measured.
 SUITE = [
+    # procedural / copyable
+    ("PROC_REPEAT", "Repeat this sentence three times: The server is up and "
+                    "running. The server is up and running. The server"),
+    ("PROC_REPEAT", "Copy the line below twice.\nERROR 404 page not found at "
+                    "/api/users\nERROR 404 page not found at /api/users\n"
+                    "ERROR 404 page"),
+    ("PROC_REPEAT", "The quick brown fox jumps over the lazy dog. The quick "
+                    "brown fox jumps over the lazy dog. The quick brown"),
+    ("PROC_JSON",   '{"name": "Alice", "age": 30, "city": "Paris"}\n'
+                    '{"name": "Bob", "age": 25, "city": "London"}\n'
+                    '{"name": "Carol", "age": 41,'),
+    ("PROC_JSON",   '[{"id": 1, "status": "active"}, {"id": 2, "status": '
+                    '"active"}, {"id": 3,'),
+    ("PROC_CODE",   "def calculate_total(items):\n    total = 0\n    for item "
+                    "in items:\n        total += item.price\n    return total\n\n"
+                    "# The same function, duplicated below:\ndef "
+                    "calculate_total(items):\n    total = 0\n    for item"),
+    ("PROC_LOG",    "2026-07-01 10:00:01 INFO worker started\n"
+                    "2026-07-01 10:00:02 INFO worker started\n"
+                    "2026-07-01 10:00:03 INFO worker"),
+    # open-ended / semantic (expected LLM territory)
     ("CASUAL",   "Hello, how are you today?"),
     ("CASUAL",   "Good morning! The weather is"),
     ("CASUAL",   "Thanks so much for the help,"),
@@ -206,15 +255,71 @@ def cmd_measure():
                 print(f"{dom:9}   SKIP  short generation "
                       f"(draft {len(draft)}, verify {len(verify)})")
                 continue   # a truncated run must not inflate the domain rate
-            rate, nmatch = acceptance(draft, verify)
+            rate, nchars = acceptance(draft, verify)
             record(st, dom, rate)
-            print(f"{dom:9} {rate:7.2f} {nmatch:4d}/{len(draft):<2d} "
+            print(f"{dom:11} {rate:7.2f} {nchars:4d}ch "
                   f"{t_rpi:6.2f} {t_ver:6.2f}  {prompt[:44]!r}")
         except Exception as e:
             print(f"{dom:9}   ERROR {e}")
     save_stats(st)
     print(f"\nstats -> {STATS_PATH}")
     cmd_stats()
+
+def cmd_speculate():
+    """Simulate real speculative decoding with resync, per prompt.
+
+    Single-shot LCP under-credits an accelerator: one early divergence voids
+    every later match. Actual spec-dec resyncs — on a miss the verifier
+    supplies one corrected token and drafting continues from the corrected
+    history. This measures DRAFT SHARE: the fraction of the verifier's output
+    characters supplied by the RPI draft under that standard accounting
+    (draft k=8 per round, one free verifier token per miss).
+    """
+    K = 8
+    print(f"{'domain':11} {'share':>6} {'drafted':>9} {'calls':>5}  prompt")
+    shares = {}
+    for dom, prompt in SUITE:
+        try:
+            ids = tokenize(prompt)
+            vtoks, _ = verifier_greedy(ids, DRAFT_K)
+            if not vtoks:
+                print(f"{dom:11}   SKIP  empty verifier output")
+                continue
+            # char span of each verifier token, for the "free token" on a miss
+            spans, txt = [], ""
+            for t in vtoks:
+                piece = detokenize([t])
+                spans.append((len(txt), len(txt) + len(piece)))
+                txt += piece
+            V = txt
+
+            pos, drafted, calls = 0, 0, 0
+            while pos < len(V) and calls < 12:
+                hist = tokenize(prompt + V[:pos])
+                d, _ = rpi_draft(hist, k=K)
+                calls += 1
+                D = detokenize(d)
+                m = 0
+                for a, b in zip(D, V[pos:]):
+                    if a != b:
+                        break
+                    m += 1
+                drafted += m
+                pos += m
+                if pos >= len(V):
+                    break
+                # miss: verifier supplies the rest of the token at pos (free)
+                nxt = next((e for s, e in spans if s <= pos < e), pos + 1)
+                pos = nxt
+            share = drafted / max(1, len(V))
+            shares.setdefault(dom, []).append(share)
+            print(f"{dom:11} {share:6.2f} {drafted:4d}/{len(V):<4d} {calls:5d}  "
+                  f"{prompt[:40]!r}")
+        except Exception as e:
+            print(f"{dom:11}   ERROR {e}")
+    print(f"\n{'domain':11} {'mean draft share':>16}")
+    for dom, xs in sorted(shares.items()):
+        print(f"{dom:11} {sum(xs)/len(xs):16.2f}")
 
 def cmd_stats():
     st = load_stats()
@@ -262,12 +367,16 @@ def cmd_route(prompt: str, n: int):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--measure", action="store_true")
+    ap.add_argument("--speculate", action="store_true",
+                    help="resync draft-share simulation (the accelerator metric)")
     ap.add_argument("--stats", action="store_true")
     ap.add_argument("--route", metavar="PROMPT")
     ap.add_argument("-n", type=int, default=64, help="tokens for --route")
     args = ap.parse_args()
     if args.measure:
         cmd_measure()
+    elif args.speculate:
+        cmd_speculate()
     elif args.stats:
         cmd_stats()
     elif args.route:
