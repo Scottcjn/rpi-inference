@@ -18,11 +18,22 @@
  * Baseline is the SAME binary with --no-draft (plain autoregressive), so the
  * A/B is one flag on one code path.
  *
- * Build (on the M2, against the llama.cpp checkout):
+ * BACKEND-AGNOSTIC: this file contains no Metal/CUDA/HIP code — the GPU
+ * backend is whatever the libllama you link was built with. Build once per
+ * backend (or use `make rpi-spec LLAMA_BUILD=...`):
  *   cc -O2 -o rpi-spec tools/rpi_speculative.c \
- *      -I ~/llama.cpp/include -I ~/llama.cpp/ggml/include \
- *      -L ~/llama.cpp/build-stock/bin -lllama \
- *      -Wl,-rpath,$HOME/llama.cpp/build-stock/bin
+ *      -I $LLAMA/include -I $LLAMA/ggml/include \
+ *      -L $LLAMA/<build-dir>/bin -lllama -Wl,-rpath,$LLAMA/<build-dir>/bin
+ * where <build-dir> is a Metal, CUDA, Vulkan, or HIP/ROCm build of llama.cpp.
+ * On multi-GPU/Vulkan boxes select the device with GGML_VK_VISIBLE_DEVICES.
+ *
+ * Measured (log-structured prompt / prose prompt, wall-clock vs --no-draft,
+ * identity verified per backend):
+ *   Metal  Apple M2            1.54x / 0.93x   (TinyLlama-1.1B)
+ *   CUDA   RTX 4070 Laptop     2.34x / 1.01x   (TinyLlama-1.1B)
+ *   CUDA   RTX 4070 Laptop     2.71x / 1.01x   (Qwen2.5-7B — bigger verifier,
+ *                                               bigger win, as the economics say)
+ *   Vulkan AMD Radeon 780M     1.95x / 1.04x   (TinyLlama-1.1B)
  *
  * (c) 2026 Elyan Labs
  */
@@ -97,23 +108,27 @@ static int decode_run(struct llama_context *ctx, const llama_token *toks,
 int main(int argc, char **argv) {
     const char *model_path = NULL, *prompt = "";
     int n_gen = 128, draft_k = 8, use_draft = 1, show_text = 0;
+    int n_ctx_arg = 4096;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) model_path = argv[++i];
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) prompt = argv[++i];
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) n_gen = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-k") && i + 1 < argc) draft_k = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-c") && i + 1 < argc) n_ctx_arg = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--no-draft")) use_draft = 0;
         else if (!strcmp(argv[i], "-t")) show_text = 1;
         else { fprintf(stderr, "usage: %s -m model.gguf -p prompt [-n N] "
-                       "[-k draft_k] [--no-draft] [-t]\n", argv[0]); return 1; }
+                       "[-k draft_k] [-c ctx] [--no-draft] [-t]\n", argv[0]); return 1; }
     }
     if (!model_path) { fprintf(stderr, "need -m model.gguf\n"); return 1; }
     if (draft_k < 1) draft_k = 1;
     if (draft_k > 63) draft_k = 63;   /* d[64]/run[65] capacity — -k 65 was a
                                          stack overflow (tri-brain catch) */
+    if (n_ctx_arg < 512) n_ctx_arg = 512;
+    if (n_ctx_arg > 32768) n_ctx_arg = 32768;
     if (n_gen < 1) n_gen = 1;
-    if (n_gen > 3500) n_gen = 3500;   /* keep prompt+gen inside cap/n_ctx */
+    if (n_gen > n_ctx_arg - 96) n_gen = n_ctx_arg - 96;  /* leave prompt room */
 
     llama_backend_init();
     struct llama_model_params mp = llama_model_default_params();
@@ -125,14 +140,14 @@ int main(int argc, char **argv) {
     const llama_token eos = llama_vocab_eos(vocab);
 
     struct llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = 4096; cp.n_batch = 4096;
+    cp.n_ctx = (unsigned)n_ctx_arg; cp.n_batch = (unsigned)n_ctx_arg;
     struct llama_context *ctx = llama_init_from_model(model, cp);
     if (!ctx) { fprintf(stderr, "context init failed\n"); return 1; }
     llama_memory_t mem = llama_get_memory(ctx);
 
     /* history buffer: prompt + generated. cap == n_ctx (cp.n_ctx below is
      * set from this) so the loop guard and the KV limit cannot drift apart. */
-    const int cap = 4096;
+    const int cap = n_ctx_arg;
     llama_token *hist = malloc(sizeof(llama_token) * cap);
     if (!hist) { fprintf(stderr, "oom\n"); return 1; }
     /* saved logits row: on a rejection we keep the last ACCEPTED position's
