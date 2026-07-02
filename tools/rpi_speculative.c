@@ -39,6 +39,12 @@
  *   CUDA   Tesla V100-SXM2     3.63x / 0.93x   (TinyLlama-1.1B, 746 tok/s)
  *   CUDA   Tesla V100-SXM2     1.98x / 0.91x   (Qwen2.5-7B, card shared with
  *                                               a live server)
+ * Backend-ratio check (same RTX 4070, two backends): CUDA 2.34x vs Vulkan
+ * 1.92x with near-identical baselines — the ratio roughly holds and the
+ * native backend extracts ~20% more, so a native HIP build should beat the
+ * Vulkan numbers above on the same AMD silicon. ROCm build of llama.cpp:
+ *   cmake -B build-hip -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx90a  # MI250
+ *   (gfx942 for MI300X); then make rpi-spec LLAMA_BUILD=build-hip
  * NOTE: CUDA enumerates devices fastest-first by default, so nvidia-smi index
  * != CUDA index on mixed boxes (CUDA_VISIBLE_DEVICES=1 picked the M40 on a
  * V100+M40 machine).
