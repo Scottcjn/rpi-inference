@@ -457,10 +457,7 @@ void rpi_round(const RPIModel *model, const RPIHWProfile *hw,
 
 /* ── Token Emission (v2: multi-cell voting + diversity) ─── */
 
-/* Repetition penalty history */
-#define RPI_REP_WINDOW 32
-static uint32_t rep_history[RPI_REP_WINDOW];
-static uint32_t rep_pos = 0;
+/* Repetition-penalty history lives in RPIState (per-stream, thread-safe). */
 
 uint32_t rpi_emit_next(const RPIModel *model, const RPIHWProfile *hw,
                        RPIState *st) {
@@ -526,7 +523,7 @@ uint32_t rpi_emit_next(const RPIModel *model, const RPIHWProfile *hw,
 
     /* Repetition penalty: halve scores of recently emitted tokens */
     for (uint32_t r = 0; r < RPI_REP_WINDOW; r++) {
-        uint32_t prev_tok = rep_history[r];
+        uint32_t prev_tok = st->rep_history[r];
         if (prev_tok < model->hdr.vocab_size && st->tok_scores[prev_tok] > 0) {
             st->tok_scores[prev_tok] >>= 2;  /* quarter the score */
         }
@@ -623,8 +620,8 @@ uint32_t rpi_emit_next(const RPIModel *model, const RPIHWProfile *hw,
     }
 
     /* Update repetition history */
-    rep_history[rep_pos % RPI_REP_WINDOW] = chosen;
-    rep_pos++;
+    st->rep_history[st->rep_pos % RPI_REP_WINDOW] = chosen;
+    st->rep_pos++;
 
     return chosen;
 }

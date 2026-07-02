@@ -59,6 +59,12 @@ typedef struct {
     uint32_t n_touched;                 /* count of the above (may hold dups) */
     uint32_t last_token;
 
+    /* Repetition-penalty history. Per-stream state (was a file static, which
+     * would be shared — and corrupted — across concurrent streams). */
+#define RPI_REP_WINDOW 32
+    uint32_t rep_history[RPI_REP_WINDOW];
+    uint32_t rep_pos;
+
     /* Timing */
     uint64_t tb_prev;              /* timebase at previous token */
     uint64_t tb_round_start;       /* timebase at round start */

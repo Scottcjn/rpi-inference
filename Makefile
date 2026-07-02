@@ -4,7 +4,7 @@
 
 CC ?= gcc
 CFLAGS = -O3 -Wall -Wextra -I include
-LDFLAGS =
+LDFLAGS = -pthread
 
 # Auto-detect architecture
 UNAME_M := $(shell uname -m)

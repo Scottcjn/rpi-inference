@@ -78,6 +78,13 @@ int rpi_model_load(RPIModel *model, const char *path) {
             model->hdr.n_routes, model->hdr.n_emits,
             model->hdr.vocab_size);
 
+#if defined(__aarch64__)
+    /* Build the NEON control table NOW, on the loading thread, so concurrent
+     * generation streams only ever READ it. The lazy call in run_cell_perms
+     * then always hits the already-built fast path. */
+    rpi_neon_prepare(model->perm_blocks, model->hdr.n_perm_blocks);
+#endif
+
     return 0;
 }
 
