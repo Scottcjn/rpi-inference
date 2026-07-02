@@ -604,6 +604,25 @@ uint32_t rpi_emit_next(const RPIModel *model, const RPIHWProfile *hw,
         }
     }
 
+    /* RPI_GREEDY=1: deterministic argmax over the top-K instead of entropy
+     * sampling. This is the drafting mode for speculative decoding — a draft
+     * should be the model's best guess, and deterministic drafts make
+     * verifier acceptance measurable. */
+    static int greedy = -1;
+    if (greedy < 0) {
+        const char *e = getenv("RPI_GREEDY");
+        greedy = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    if (greedy) {
+        int best = 0;
+        for (int k = 1; k < 8; k++)
+            if (top_scores[k] > top_scores[best]) best = k;
+        uint32_t chosen_g = top_ids[best];
+        st->rep_history[st->rep_pos % RPI_REP_WINDOW] = chosen_g;
+        st->rep_pos++;
+        return chosen_g;
+    }
+
     /* Sample from top-K using hardware entropy */
     uint64_t tb = rpi_tb_now();
     int32_t total = 0;

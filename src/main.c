@@ -50,7 +50,9 @@ static void print_banner(void) {
 static void usage(const char *prog) {
     fprintf(stderr, "Usage: %s [options]\n", prog);
     fprintf(stderr, "  -m <path>     Model file (.rpi)\n");
-    fprintf(stderr, "  -p <text>     Prompt text\n");
+    fprintf(stderr, "  -p <text>     Prompt text (byte-level tokens)\n");
+    fprintf(stderr, "  -T <ids>      Prompt as comma-separated token IDs (for models\n");
+    fprintf(stderr, "                with a real tokenizer vocab; overrides -p)\n");
     fprintf(stderr, "  -n <int>      Max tokens to generate (default: 64)\n");
     fprintf(stderr, "  -j <int>      Parallel independent streams (default: 1;\n");
     fprintf(stderr, "                each generates -n tokens; aggregate tok/s reported.\n");
@@ -67,12 +69,14 @@ int main(int argc, char **argv) {
 
     int opt;
     int n_streams = 1;
-    while ((opt = getopt(argc, argv, "m:p:n:j:vh")) != -1) {
+    const char *tok_prompt = NULL;
+    while ((opt = getopt(argc, argv, "m:p:n:j:T:vh")) != -1) {
         switch (opt) {
             case 'm': model_path = optarg; break;
             case 'p': prompt = optarg; break;
             case 'n': max_tokens = atoi(optarg); break;
             case 'j': n_streams = atoi(optarg); break;
+            case 'T': tok_prompt = optarg; break;
             case 'v': verbose = 1; break;
             case 'h': usage(argv[0]); return 0;
             default:  usage(argv[0]); return 1;
@@ -107,7 +111,34 @@ int main(int argc, char **argv) {
     uint32_t prompt_ids[4096];
     uint32_t prompt_len = 0;
 
-    if (prompt) {
+    if (tok_prompt) {
+        /* Comma/space-separated token IDs (a router passes real tokenizer
+         * output here; the byte-level -p path is only right for vocab<=256
+         * test models). Out-of-range IDs are REJECTED LOUDLY, not silently
+         * truncated or dropped — the prompt the model sees must be the
+         * prompt the caller sent. */
+        const char *p = tok_prompt;
+        uint32_t n_bad = 0;
+        while (*p && prompt_len < 4096) {
+            char *end;
+            unsigned long v = strtoul(p, &end, 10);
+            if (end == p) { p++; continue; }   /* skip separator */
+            if (v >= (unsigned long)model.hdr.vocab_size) {
+                n_bad++;
+            } else {
+                prompt_ids[prompt_len++] = (uint32_t)v;
+            }
+            p = end;
+        }
+        if (n_bad) {
+            fprintf(stderr, "Error: -T contains %u token id(s) outside vocab "
+                    "(%u); refusing to run a silently altered prompt\n",
+                    n_bad, model.hdr.vocab_size);
+            rpi_model_free(&model);
+            return 1;
+        }
+        fprintf(stderr, "[RPI] Prompt: %u token ids\n", prompt_len);
+    } else if (prompt) {
         fprintf(stderr, "[RPI] Prompt: \"%s\"\n", prompt);
         for (const char *p = prompt; *p && prompt_len < 4096; p++) {
             prompt_ids[prompt_len++] = (uint32_t)(uint8_t)*p;
