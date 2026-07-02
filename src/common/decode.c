@@ -13,6 +13,49 @@
 #include <string.h>
 #include <stdlib.h>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+/* Lane energy (L1 norm of the 64 int16 lanes). Used for routing decisions and
+ * emission strength. NEON version is BIT-EXACT vs the scalar loop: vabal_s16
+ * against zero computes |v| widened to s32 before accumulating, so even
+ * INT16_MIN contributes exactly 32768. */
+static inline int32_t rpi_lane_energy(const int16_t *lanes) {
+#if defined(__aarch64__)
+    int32x4_t acc = vdupq_n_s32(0);
+    int16x4_t zero = vdup_n_s16(0);
+    for (int j = 0; j < RPI_LANES; j += 8) {
+        int16x8_t v = vld1q_s16(lanes + j);
+        acc = vabal_s16(acc, vget_low_s16(v), zero);
+        acc = vabal_s16(acc, vget_high_s16(v), zero);
+    }
+    return vaddvq_s32(acc);
+#else
+    int32_t energy = 0;
+    for (int j = 0; j < RPI_LANES; j++) {
+        int16_t v = lanes[j];
+        energy += (v >= 0) ? v : -v;
+    }
+    return energy;
+#endif
+}
+
+/* ── Coarse phase profiler (RPI_PROFILE=1) ──────────────────
+ * Accumulates timebase ticks in three buckets so we can see where per-token
+ * time actually goes (permute vs routing/resonance vs vocab scoring) before
+ * optimizing the wrong one. Percentages only; no tb_freq needed. */
+static uint64_t g_prof_perm = 0, g_prof_route = 0, g_prof_reson = 0, g_prof_emit = 0;
+static uint64_t g_prof_wall0 = 0;   /* generation start, for coverage */
+static int g_prof_on = -1;
+static int prof_enabled(void) {
+    if (g_prof_on < 0) {
+        const char *e = getenv("RPI_PROFILE");
+        g_prof_on = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return g_prof_on;
+}
+
 /* ── State Management ───────────────────────────────────── */
 
 void rpi_state_init(RPIState *st) {
@@ -25,6 +68,9 @@ void rpi_state_reset(RPIState *st) {
     st->round = 0;
     st->sig_prev = 0;
     memset(st->tok_scores, 0, sizeof(st->tok_scores));
+    st->n_touched = 0;  /* tok_scores is fully zeroed, so the touched list restarts */
+    memset(st->rep_history, 0, sizeof(st->rep_history));
+    st->rep_pos = 0;    /* reset means reset: no repetition carry-over */
 }
 
 /* ── Hardware Detection ─────────────────────────────────── */
@@ -158,6 +204,26 @@ static void run_cell_perms(const RPIModel *model, const RPICell *cell,
 #endif
     }
 
+#if defined(__aarch64__)
+    /* NEON fast path: the write-variant kernel (out = ±in[src], no accumulate)
+     * is arithmetically identical to memset+accumulate and is in-place safe
+     * (all input loaded to registers before any store). So run each block
+     * directly lanes -> lanes: no tmp, no 128B memset, no 128B memcpy per
+     * block. RPI_OLD_PERM=1 keeps the old ping-pong for same-binary A/B. */
+    static int old_perm = -1;
+    if (old_perm < 0) {
+        const char *e = getenv("RPI_OLD_PERM");
+        old_perm = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    if (!force_scalar && !old_perm) {
+        for (uint32_t b = 0; b < cell->perm_block_count; b++) {
+            const RPIPermBlock *block = &model->perm_blocks[cell->perm_block_start + b];
+            rpi_run_perm_block_neon_write(block, lanes, lanes);
+        }
+        return;
+    }
+#endif
+
     /* Temporary buffer for ping-pong */
     int16_t tmp[RPI_LANES];
 
@@ -265,6 +331,8 @@ void rpi_round(const RPIModel *model, const RPIHWProfile *hw,
      *   3. Measure cache resonance
      */
 
+    uint64_t _pt0 = prof_enabled() ? rpi_tb_now() : 0;
+
     /* Phase 1: Run permutations on all active cells */
     for (uint32_t i = 0; i < st->n_active; i++) {
         uint32_t cell_id = st->active_ids[i];
@@ -277,76 +345,145 @@ void rpi_round(const RPIModel *model, const RPIHWProfile *hw,
         run_cell_perms(model, cell, st->active_lanes[i]);
     }
 
-    /* Phase 2: Follow routes — activate downstream cells */
-    uint32_t new_active[RPI_MAX_ACTIVE_CELLS];
-    int16_t  new_lanes[RPI_MAX_ACTIVE_CELLS][RPI_LANES];
-    uint32_t n_new = 0;
+    if (prof_enabled()) { uint64_t t = rpi_tb_now(); g_prof_perm += t - _pt0; _pt0 = t; }
 
-    /* Keep existing active cells */
-    memcpy(new_active, st->active_ids, st->n_active * sizeof(uint32_t));
-    memcpy(new_lanes, st->active_lanes, st->n_active * sizeof(new_lanes[0]));
-    n_new = st->n_active;
+    /* Phase 2: Follow routes — activate downstream cells.
+     *
+     * RPI_OLD_ROUTE=1 selects the original buffered version (double-copies the
+     * whole lane state into scratch buffers each round). The default routes
+     * IN PLACE: existing cells are untouched, new cells are appended straight
+     * into st->active_ids / st->active_lanes past the original count. Identical
+     * behavior (same dedup over the growing set, same decayed lanes from the
+     * source cell), minus four memcpys and a 16 KB stack buffer per round. */
+    static int old_route = -1;
+    if (old_route < 0) {
+        const char *e = getenv("RPI_OLD_ROUTE");
+        old_route = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
 
-    for (uint32_t i = 0; i < st->n_active; i++) {
-        uint32_t cell_id = st->active_ids[i];
-        const RPICell *cell = &model->cells[cell_id];
+    if (old_route) {
+        uint32_t new_active[RPI_MAX_ACTIVE_CELLS];
+        int16_t  new_lanes[RPI_MAX_ACTIVE_CELLS][RPI_LANES];
+        uint32_t n_new;
 
-        /* Compute lane energy (L1 norm) for routing decisions */
-        int32_t energy = 0;
-        for (int j = 0; j < RPI_LANES; j++) {
-            int16_t v = st->active_lanes[i][j];
-            energy += (v >= 0) ? v : -v;
+        memcpy(new_active, st->active_ids, st->n_active * sizeof(uint32_t));
+        memcpy(new_lanes, st->active_lanes, st->n_active * sizeof(new_lanes[0]));
+        n_new = st->n_active;
+
+        for (uint32_t i = 0; i < st->n_active; i++) {
+            int32_t energy = rpi_lane_energy(st->active_lanes[i]);
+            if (energy < 64 * 10) continue;
+
+            const RPICell *cell = &model->cells[st->active_ids[i]];
+            for (uint32_t r = 0; r < cell->route_count && r < RPI_MAX_ROUTES; r++) {
+                uint32_t dst = model->routes[cell->route_start + r].dst_cell_id;
+                int found = 0;
+                for (uint32_t k = 0; k < n_new; k++)
+                    if (new_active[k] == dst) { found = 1; break; }
+                if (found || n_new >= model->hdr.max_active) continue;
+                new_active[n_new] = dst;
+                for (int j = 0; j < RPI_LANES; j++)
+                    new_lanes[n_new][j] = st->active_lanes[i][j] >> 2;
+                n_new++;
+            }
+        }
+        st->n_active = n_new;
+        memcpy(st->active_ids, new_active, n_new * sizeof(uint32_t));
+        memcpy(st->active_lanes, new_lanes, n_new * sizeof(new_lanes[0]));
+    } else {
+        /* In-place, with an O(1) hash-set membership check instead of the old
+         * O(n_active) linear "already active?" scan. That scan made routing
+         * O(n_active^2 * routes) per round and dominated per-token time; the
+         * hash set makes it O(n_active * routes). Open addressing, linear
+         * probe; 0xFFFFFFFF marks empty. Sized well above max_active. */
+        #define RPI_SEEN_SZ 512
+        #define RPI_SEEN_MASK (RPI_SEEN_SZ - 1)
+        uint32_t seen[RPI_SEEN_SZ];
+        memset(seen, 0xFF, sizeof(seen));
+        for (uint32_t k = 0; k < st->n_active; k++) {
+            uint32_t id = st->active_ids[k];
+            uint32_t h = (id * 2654435761u) & RPI_SEEN_MASK;
+            while (seen[h] != 0xFFFFFFFFu && seen[h] != id) h = (h + 1) & RPI_SEEN_MASK;
+            seen[h] = id;
         }
 
-        /* Only route from high-energy cells */
-        if (energy < 64 * 10)  /* threshold */
-            continue;
+        uint32_t orig_active = st->n_active;
+        for (uint32_t i = 0; i < orig_active; i++) {
+            int32_t energy = rpi_lane_energy(st->active_lanes[i]);
+            if (energy < 64 * 10) continue;
 
-        for (uint32_t r = 0; r < cell->route_count && r < RPI_MAX_ROUTES; r++) {
-            const RPIRoute *route = &model->routes[cell->route_start + r];
-            uint32_t dst = route->dst_cell_id;
-
-            /* Check if already active */
-            int found = 0;
-            for (uint32_t k = 0; k < n_new; k++) {
-                if (new_active[k] == dst) { found = 1; break; }
+            const RPICell *cell = &model->cells[st->active_ids[i]];
+            for (uint32_t r = 0; r < cell->route_count && r < RPI_MAX_ROUTES; r++) {
+                uint32_t dst = model->routes[cell->route_start + r].dst_cell_id;
+                uint32_t h = (dst * 2654435761u) & RPI_SEEN_MASK;
+                while (seen[h] != 0xFFFFFFFFu && seen[h] != dst) h = (h + 1) & RPI_SEEN_MASK;
+                if (seen[h] == dst || st->n_active >= model->hdr.max_active) continue;
+                uint32_t slot = st->n_active;
+                st->active_ids[slot] = dst;
+                for (int j = 0; j < RPI_LANES; j++)
+                    st->active_lanes[slot][j] = st->active_lanes[i][j] >> 2;
+                st->n_active++;
+                seen[h] = dst;  /* probe stopped at the empty slot for dst */
             }
-            if (found || n_new >= model->hdr.max_active)
-                continue;
-
-            /* Activate downstream cell with scaled lanes */
-            new_active[n_new] = dst;
-            for (int j = 0; j < RPI_LANES; j++) {
-                new_lanes[n_new][j] = st->active_lanes[i][j] >> 2; /* decay */
-            }
-            n_new++;
         }
     }
 
-    /* Update state */
-    st->n_active = n_new;
-    memcpy(st->active_ids, new_active, n_new * sizeof(uint32_t));
-    memcpy(st->active_lanes, new_lanes, n_new * sizeof(new_lanes[0]));
+    /* Opt-in correctness check (RPI_ROUTE_CHECK=1): the hash-set dedup is
+     * correct iff the active set never contains a duplicate. Scan for dups. */
+    {
+        static int route_check = -1;
+        if (route_check < 0) {
+            const char *e = getenv("RPI_ROUTE_CHECK");
+            route_check = (e && e[0] && e[0] != '0') ? 1 : 0;
+        }
+        if (route_check) {
+            for (uint32_t a = 0; a < st->n_active; a++)
+                for (uint32_t b = a + 1; b < st->n_active; b++)
+                    if (st->active_ids[a] == st->active_ids[b]) {
+                        static int rep = 0;
+                        if (rep++ < 5)
+                            fprintf(stderr, "[RPI] ROUTE_CHECK: duplicate active cell %u\n",
+                                    st->active_ids[a]);
+                    }
+        }
+    }
+
+    if (prof_enabled()) { uint64_t t = rpi_tb_now(); g_prof_route += t - _pt0; _pt0 = t; }
 
     /* Phase 3: Probe cache resonance */
     rpi_probe_resonance(model, hw, st);
+
+    if (prof_enabled()) g_prof_reson += rpi_tb_now() - _pt0;
 
     st->round++;
 }
 
 /* ── Token Emission (v2: multi-cell voting + diversity) ─── */
 
-/* Repetition penalty history */
-#define RPI_REP_WINDOW 32
-static uint32_t rep_history[RPI_REP_WINDOW];
-static uint32_t rep_pos = 0;
+/* Repetition-penalty history lives in RPIState (per-stream, thread-safe). */
 
 uint32_t rpi_emit_next(const RPIModel *model, const RPIHWProfile *hw,
                        RPIState *st) {
     (void)hw;
 
-    /* Clear scores */
-    memset(st->tok_scores, 0, model->hdr.vocab_size * sizeof(int32_t));
+    /* RPI_DENSE_EMIT=1 forces the old full-vocab path for same-binary A/B. */
+    static int dense_emit = -1;
+    if (dense_emit < 0) {
+        const char *e = getenv("RPI_DENSE_EMIT");
+        dense_emit = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+
+    /* Clear scores. Sparse (default): wipe only slots dirtied last step, an
+     * O(touched) lazy clear that keeps the invariant "untouched reads 0" and
+     * replaces the O(vocab) memset (was ~a third of per-token time at 32k
+     * vocab). Dense: the old full-vocab memset. */
+    if (dense_emit) {
+        memset(st->tok_scores, 0, model->hdr.vocab_size * sizeof(int32_t));
+    } else {
+        for (uint32_t i = 0; i < st->n_touched; i++)
+            st->tok_scores[st->touched[i]] = 0;
+    }
+    st->n_touched = 0;
 
     /* Collect emissions from ALL active cells (multi-cell voting) */
     for (uint32_t i = 0; i < st->n_active; i++) {
@@ -355,11 +492,7 @@ uint32_t rpi_emit_next(const RPIModel *model, const RPIHWProfile *hw,
         const RPICell *cell = &model->cells[cell_id];
 
         /* Lane energy as cell activation strength */
-        int32_t energy = 0;
-        for (int j = 0; j < RPI_LANES; j++) {
-            int16_t v = st->active_lanes[i][j];
-            energy += (v >= 0) ? v : -v;
-        }
+        int32_t energy = rpi_lane_energy(st->active_lanes[i]);
 
         /* Bank diversity bonus: cells from underrepresented banks score higher */
         int32_t bank_bonus = (cell->bank_id != (st->phase & 3)) ? 50 : 0;
@@ -382,36 +515,112 @@ uint32_t rpi_emit_next(const RPIModel *model, const RPIHWProfile *hw,
 
             if (emit->token_id < model->hdr.vocab_size) {
                 st->tok_scores[emit->token_id] += score;
+                /* Record the dirtied slot so we can scan/clear it sparsely.
+                 * Duplicates are fine: the score already accumulated in the
+                 * slot, and the top-K scan below dedups. */
+                if (st->n_touched < RPI_MAX_TOUCHED)
+                    st->touched[st->n_touched++] = emit->token_id;
             }
         }
     }
 
     /* Repetition penalty: halve scores of recently emitted tokens */
     for (uint32_t r = 0; r < RPI_REP_WINDOW; r++) {
-        uint32_t prev_tok = rep_history[r];
+        uint32_t prev_tok = st->rep_history[r];
         if (prev_tok < model->hdr.vocab_size && st->tok_scores[prev_tok] > 0) {
             st->tok_scores[prev_tok] >>= 2;  /* quarter the score */
         }
     }
 
-    /* Top-K sampling with hardware entropy (K=8) */
-    /* Find top 8 candidates */
+    /* Top-K sampling with hardware entropy (K=8).
+     * Scan ONLY the touched candidates, not the whole vocab. The set of tokens
+     * with score>0 is exactly the touched set (untouched read 0 by invariant),
+     * so this yields the same top-K set as the old full-vocab scan. */
     uint32_t top_ids[8] = {0};
     int32_t  top_scores[8] = {0};
 
-    for (uint32_t t = 0; t < model->hdr.vocab_size; t++) {
-        if (st->tok_scores[t] <= 0) continue;
+    if (dense_emit) {
+        /* Old full-vocab scan (A/B baseline). */
+        for (uint32_t t = 0; t < model->hdr.vocab_size; t++) {
+            if (st->tok_scores[t] <= 0) continue;
+            int min_idx = 0;
+            for (int k = 1; k < 8; k++)
+                if (top_scores[k] < top_scores[min_idx]) min_idx = k;
+            if (st->tok_scores[t] > top_scores[min_idx]) {
+                top_scores[min_idx] = st->tok_scores[t];
+                top_ids[min_idx] = t;
+            }
+        }
+    } else {
+        for (uint32_t idx = 0; idx < st->n_touched; idx++) {
+            uint32_t t = st->touched[idx];
+            int32_t sc = st->tok_scores[t];
+            if (sc <= 0) continue;
 
-        /* Find minimum in top-K */
-        int min_idx = 0;
-        for (int k = 1; k < 8; k++) {
-            if (top_scores[k] < top_scores[min_idx])
-                min_idx = k;
+            /* Skip if already placed (touched[] may contain duplicates). */
+            int dup = 0;
+            for (int k = 0; k < 8; k++)
+                if (top_scores[k] > 0 && top_ids[k] == t) { dup = 1; break; }
+            if (dup) continue;
+
+            int min_idx = 0;
+            for (int k = 1; k < 8; k++)
+                if (top_scores[k] < top_scores[min_idx]) min_idx = k;
+            if (sc > top_scores[min_idx]) {
+                top_scores[min_idx] = sc;
+                top_ids[min_idx] = t;
+            }
         }
-        if (st->tok_scores[t] > top_scores[min_idx]) {
-            top_scores[min_idx] = st->tok_scores[t];
-            top_ids[min_idx] = t;
+    }
+
+    /* Opt-in differential self-check: verify the sparse top-K SET matches the
+     * old dense full-vocab scan. Resolved once; off by default. */
+    static int emit_check = -1;
+    if (emit_check < 0) {
+        const char *e = getenv("RPI_EMIT_CHECK");
+        emit_check = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    if (emit_check) {
+        uint32_t d_ids[8] = {0}; int32_t d_scores[8] = {0};
+        for (uint32_t t = 0; t < model->hdr.vocab_size; t++) {
+            if (st->tok_scores[t] <= 0) continue;
+            int mi = 0;
+            for (int k = 1; k < 8; k++) if (d_scores[k] < d_scores[mi]) mi = k;
+            if (st->tok_scores[t] > d_scores[mi]) { d_scores[mi] = st->tok_scores[t]; d_ids[mi] = t; }
         }
+        /* Compare as multisets of (score) present with score>0: same top-K
+         * scores => same candidate strength distribution. */
+        int32_t ss[8], ds[8]; int ns = 0, nd = 0;
+        for (int k = 0; k < 8; k++) { if (top_scores[k] > 0) ss[ns++] = top_scores[k];
+                                      if (d_scores[k] > 0) ds[nd++] = d_scores[k]; }
+        for (int a = 0; a < ns; a++) for (int b = a + 1; b < ns; b++) if (ss[b] > ss[a]) { int32_t t = ss[a]; ss[a] = ss[b]; ss[b] = t; }
+        for (int a = 0; a < nd; a++) for (int b = a + 1; b < nd; b++) if (ds[b] > ds[a]) { int32_t t = ds[a]; ds[a] = ds[b]; ds[b] = t; }
+        int mismatch = (ns != nd);
+        for (int k = 0; !mismatch && k < ns; k++) if (ss[k] != ds[k]) mismatch = 1;
+        if (mismatch) {
+            static int reported = 0;
+            if (reported++ < 5)
+                fprintf(stderr, "[RPI] EMIT_CHECK MISMATCH: sparse topK=%d dense topK=%d\n", ns, nd);
+        }
+    }
+
+    /* RPI_GREEDY=1: deterministic argmax over the top-K instead of entropy
+     * sampling. This is the drafting mode for speculative decoding — a draft
+     * should be the model's best guess, and deterministic drafts make
+     * verifier acceptance measurable. */
+    static int greedy = -1;
+    if (greedy < 0) {
+        const char *e = getenv("RPI_GREEDY");
+        greedy = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    if (greedy) {
+        int best = 0;
+        for (int k = 1; k < 8; k++)
+            if (top_scores[k] > top_scores[best]) best = k;
+        uint32_t chosen_g = top_ids[best];
+        st->rep_history[st->rep_pos % RPI_REP_WINDOW] = chosen_g;
+        st->rep_pos++;
+        return chosen_g;
     }
 
     /* Sample from top-K using hardware entropy */
@@ -433,8 +642,8 @@ uint32_t rpi_emit_next(const RPIModel *model, const RPIHWProfile *hw,
     }
 
     /* Update repetition history */
-    rep_history[rep_pos % RPI_REP_WINDOW] = chosen;
-    rep_pos++;
+    st->rep_history[st->rep_pos % RPI_REP_WINDOW] = chosen;
+    st->rep_pos++;
 
     return chosen;
 }
@@ -507,7 +716,9 @@ uint32_t rpi_decode_token(const RPIModel *model, const RPIHWProfile *hw,
     }
 
     /* Emit next token with diversity */
+    uint64_t _et0 = prof_enabled() ? rpi_tb_now() : 0;
     uint32_t next = rpi_emit_next(model, hw, st);
+    if (prof_enabled()) g_prof_emit += rpi_tb_now() - _et0;
 
     /* Activate seed cells for next token */
     rpi_activate_token(model, st, next);
@@ -523,10 +734,58 @@ uint32_t rpi_decode_token(const RPIModel *model, const RPIHWProfile *hw,
 
 /* ── Generate Text ──────────────────────────────────────── */
 
+/* ── Context-copy drafting (RPI_NGRAM=1) ─────────────────────
+ * RPI as a matmul-free PROCEDURAL accelerator: instead of asking the cell
+ * engine to invent the next token, find the longest suffix of the recent
+ * tokens that already occurred earlier in [prompt + generated] and COPY its
+ * continuation. This is prompt-lookup / n-gram speculative drafting — pure
+ * table permutation, zero multiplies, no model quality required — and it is
+ * the token class (copied spans, boilerplate, structure) where a draft can
+ * actually agree with an LLM verifier. Semantics stay with the LLM; the
+ * reordering-shaped tokens run here.
+ *
+ * hist(i) spans prompt then output. Longest match wins, ties go to the MOST
+ * RECENT occurrence. Returns the continuation token, or UINT32_MAX if no
+ * n-gram of length >= NGRAM_MIN matches. */
+#define NGRAM_MAX 8
+#define NGRAM_MIN 1   /* n=1 (most-recent unigram) rescues structural copies
+                         like JSON keys after a novel value token; llama.cpp's
+                         prompt-lookup allows it for the same reason */
+static uint32_t ngram_copy_next(const uint32_t *prompt_ids, uint32_t prompt_len,
+                                const uint32_t *output_ids, uint32_t n_out) {
+    const uint32_t T = prompt_len + n_out;
+    if (T < NGRAM_MIN + 1) return UINT32_MAX;
+
+#define HIST(i) ((i) < prompt_len ? prompt_ids[(i)] : output_ids[(i) - prompt_len])
+
+    uint32_t nmax = (T - 1 < NGRAM_MAX) ? T - 1 : NGRAM_MAX;
+    for (uint32_t n = nmax; n >= NGRAM_MIN; n--) {
+        /* suffix = HIST(T-n .. T-1); scan for its most recent earlier copy */
+        for (uint32_t p = T - n; p-- > 0; ) {   /* p = candidate match start */
+            uint32_t ok = 1;
+            for (uint32_t j = 0; j < n; j++) {
+                if (HIST(p + j) != HIST(T - n + j)) { ok = 0; break; }
+            }
+            if (ok && p + n < T)
+                return HIST(p + n);             /* the copied continuation */
+        }
+    }
+#undef HIST
+    return UINT32_MAX;
+}
+
 void rpi_generate(const RPIModel *model, const RPIHWProfile *hw,
                   RPIState *st, const uint32_t *prompt_ids,
                   uint32_t prompt_len, uint32_t max_tokens,
                   uint32_t *output_ids, uint32_t *n_output) {
+    if (prof_enabled()) g_prof_wall0 = rpi_tb_now();
+
+    static int ngram_mode = -1;
+    if (ngram_mode < 0) {
+        const char *e = getenv("RPI_NGRAM");
+        ngram_mode = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+
     /* Ingest prompt */
     for (uint32_t i = 0; i < prompt_len; i++) {
         rpi_activate_token(model, st, prompt_ids[i]);
@@ -540,12 +799,67 @@ void rpi_generate(const RPIModel *model, const RPIHWProfile *hw,
     /* Generate */
     *n_output = 0;
     for (uint32_t i = 0; i < max_tokens; i++) {
-        uint32_t tok = rpi_decode_token(model, hw, st);
+        uint32_t tok;
+
+        if (ngram_mode) {
+            tok = ngram_copy_next(prompt_ids, prompt_len, output_ids, *n_output);
+            if (tok != UINT32_MAX) {
+                /* Copied continuation — DELIBERATELY lightweight. The contract
+                 * of a copy is zero engine compute: no rounds, no emission
+                 * scoring, no repetition history. Only seed-activation + phase
+                 * advance, so a later fallback token still has context. A
+                 * fallback after copies therefore runs on a state no pure-
+                 * engine path produces; that hybrid is the design, not an
+                 * accident. (A copied 0 propagates and stops generation below,
+                 * same as an engine-emitted EOS.) */
+                rpi_activate_token(model, st, tok);
+                st->phase = (st->phase + 1) & 3;
+                st->last_token = tok;
+                st->total_tokens++;
+            } else {
+                /* No copyable span — this token is not procedural. In a
+                 * dual-brain deployment this is the escalation point; standalone
+                 * we fall back to the cell engine. */
+                tok = rpi_decode_token(model, hw, st);
+            }
+        } else {
+            tok = rpi_decode_token(model, hw, st);
+        }
+
         output_ids[i] = tok;
         (*n_output)++;
 
         /* Stop on EOS (token 0 by convention) */
         if (tok == 0)
             break;
+    }
+
+    if (prof_enabled()) {
+        uint64_t tot = g_prof_perm + g_prof_route + g_prof_reson + g_prof_emit;
+        if (tot == 0) tot = 1;
+        fprintf(stderr, "[RPI] profile: permute=%.1f%%  routing=%.1f%%  "
+                "resonance=%.1f%%  vocab-scoring=%.1f%%\n",
+                100.0 * g_prof_perm / tot,
+                100.0 * g_prof_route / tot,
+                100.0 * g_prof_reson / tot,
+                100.0 * g_prof_emit / tot);
+        /* Coverage: how much of REAL generation time the buckets account for.
+         * Percentages above are shares of the instrumented buckets only; work
+         * outside them (convergence sig hash, token activation, cross-bank
+         * injection, loop overhead) shows up here as "uncounted". */
+        uint64_t wall = rpi_tb_now() - g_prof_wall0;
+        if (wall == 0) wall = 1;
+        double ns_per_tick = (hw->tb_freq > 0) ? 1e9 / (double)hw->tb_freq : 0.0;
+        uint32_t ntok = (*n_output > 0) ? *n_output : 1;
+        fprintf(stderr, "[RPI] profile: buckets cover %.1f%% of wall "
+                "(uncounted %.1f%%); per token: perm=%.0fns route=%.0fns "
+                "reson=%.0fns emit=%.0fns uncounted=%.0fns wall=%.0fns\n",
+                100.0 * tot / wall, 100.0 * (double)(wall - tot) / wall,
+                g_prof_perm * ns_per_tick / ntok,
+                g_prof_route * ns_per_tick / ntok,
+                g_prof_reson * ns_per_tick / ntok,
+                g_prof_emit * ns_per_tick / ntok,
+                (double)(wall - tot) * ns_per_tick / ntok,
+                (double)wall * ns_per_tick / ntok);
     }
 }

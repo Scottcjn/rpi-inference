@@ -3,8 +3,10 @@
 # (c) 2026 Elyan Labs
 
 CC ?= gcc
-CFLAGS = -O3 -Wall -Wextra -I include
-LDFLAGS =
+# -pthread in BOTH compile and link: compiling with it sets _REENTRANT /
+# thread-safe libc paths on platforms that need it, not just the link flag.
+CFLAGS = -O3 -Wall -Wextra -I include -pthread
+LDFLAGS = -pthread
 
 # Auto-detect architecture
 UNAME_M := $(shell uname -m)
@@ -64,3 +66,12 @@ test: rpi-cli
 
 clean:
 	rm -f $(OBJS) rpi-cli test_model.rpi
+
+# ── Speculative decoding tool (links an external llama.cpp build) ──
+# The backend (Metal/CUDA/Vulkan/HIP) is the one libllama was built with:
+#   make rpi-spec LLAMA=$(HOME)/llama.cpp LLAMA_BUILD=$(HOME)/llama.cpp/build-cuda
+LLAMA ?= $(HOME)/llama.cpp
+LLAMA_BUILD ?= $(LLAMA)/build
+rpi-spec: tools/rpi_speculative.c
+	$(CC) -O2 -o $@ $< -I $(LLAMA)/include -I $(LLAMA)/ggml/include \
+	  -L $(LLAMA_BUILD)/bin -lllama -Wl,-rpath,$(LLAMA_BUILD)/bin

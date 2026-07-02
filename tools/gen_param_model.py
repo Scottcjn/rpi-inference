@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Parametrized .rpi generator for controlled benchmarks.
 
 Usage: gen_param_model.py <out.rpi> <n_cells> <vocab_size> [perm_per_cell=2]

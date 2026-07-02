@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT
+/* SPDX-License-Identifier: AGPL-3.0-or-later
  * perm_neon.c — ARM64 NEON permutation backend for RPI
  *
  * The AArch64 answer to POWER's vec_perm is TBL (vqtbl): a byte-wise
@@ -121,6 +121,28 @@ static inline void apply_ctrl(const NeonCtrl *c, const int16_t *in, int16_t *out
     }
 }
 
+/* Write-variant hot path: out[i] = ±in[src] (0 for W=0) — no accumulate.
+ * Arithmetically identical to "memset(out,0) then accumulate", which is
+ * exactly how run_cell_perms used the accumulate kernel for its ping-pong.
+ * IN-PLACE SAFE (out may alias in): grpA/grpB load ALL 128 input bytes into
+ * registers before the first store. This removes the per-block 128B memset +
+ * 128B memcpy that made the permute bucket ~2.5x its kernel floor. */
+static inline void apply_ctrl_write(const NeonCtrl *c, const int16_t *in, int16_t *out) {
+    const uint8_t *inb = (const uint8_t *)in;
+    uint8x16x4_t grpA = vld1q_u8_x4(inb);
+    uint8x16x4_t grpB = vld1q_u8_x4(inb + 64);
+
+    for (int chunk = 0; chunk < 8; chunk++) {
+        const int base = chunk * 8;
+        uint8x16_t ga = vqtbl4q_u8(grpA, vld1q_u8(c->idxA[chunk]));
+        uint8x16_t gb = vqtbl4q_u8(grpB, vld1q_u8(c->idxB[chunk]));
+        int16x8_t gathered = vreinterpretq_s16_u8(vorrq_u8(ga, gb));
+        int16x8_t neg  = vnegq_s16(gathered);
+        uint16x8_t msk = vld1q_u16(c->mask[chunk]);
+        vst1q_s16(out + base, vbslq_s16(msk, neg, gathered));
+    }
+}
+
 /* ── Prepared-control table (built once per model) ──────────── */
 static const RPIPermBlock *g_base = NULL;
 static NeonCtrl *g_ctrl = NULL;
@@ -164,6 +186,19 @@ void rpi_run_perm_block_neon(const RPIPermBlock *block,
     NeonCtrl c;
     build_ctrl(block, &c);
     apply_ctrl(&c, in, out);
+}
+
+/* Write-variant entry point: out[i] = ±in[src_idx[i]] (no accumulate).
+ * out may alias in (in-place). See apply_ctrl_write. */
+void rpi_run_perm_block_neon_write(const RPIPermBlock *block,
+                                   const int16_t *in, int16_t *out) {
+    if (g_ctrl && g_base && block >= g_base && block < g_base + g_n) {
+        apply_ctrl_write(&g_ctrl[block - g_base], in, out);
+        return;
+    }
+    NeonCtrl c;
+    build_ctrl(block, &c);
+    apply_ctrl_write(&c, in, out);
 }
 
 #endif /* __aarch64__ */
