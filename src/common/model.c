@@ -21,8 +21,21 @@ int rpi_model_load(RPIModel *model, const char *path) {
     }
 
     struct stat st;
-    fstat(fd, &st);
+    if (fstat(fd, &st) != 0) {
+        fprintf(stderr, "[RPI] Cannot stat %s\n", path);
+        close(fd);
+        return -1;
+    }
     model->raw_size = st.st_size;
+
+    /* A file shorter than the fixed header makes the memcpy below read past
+     * the end of the mapping. */
+    if (model->raw_size < sizeof(RPIHeader)) {
+        fprintf(stderr, "[RPI] File too small: %zu bytes (need >= %zu)\n",
+                model->raw_size, sizeof(RPIHeader));
+        close(fd);
+        return -1;
+    }
 
     model->raw = mmap(NULL, model->raw_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
@@ -44,6 +57,37 @@ int rpi_model_load(RPIModel *model, const char *path) {
 
     if (model->hdr.version != RPI_VERSION) {
         fprintf(stderr, "[RPI] Unsupported version: %u\n", model->hdr.version);
+        munmap(model->raw, model->raw_size);
+        return -1;
+    }
+
+    /* Validate that every declared section actually fits inside the mapped
+     * file before we walk section base pointers off the header counts. The
+     * counts are untrusted (a .rpi is an external artifact — see
+     * tools/dual_brain_router.py, which scp's models onto remote hosts), so
+     * without this a truncated or crafted file makes the pointers below run
+     * past the end of the mapping and later cell/route/emit/embed indexing
+     * reads out of bounds -> segfault (DoS) or OOB read. Accumulate in 64-bit
+     * so the uint32 counts cannot overflow the running total. */
+    uint64_t need = (uint64_t)sizeof(RPIHeader)
+        + (uint64_t)model->hdr.n_banks       * sizeof(RPIBankDesc)
+        + (uint64_t)model->hdr.n_cells       * 36
+        + (uint64_t)model->hdr.n_perm_blocks * sizeof(RPIPermBlock)
+        + (uint64_t)model->hdr.n_routes      * sizeof(RPIRoute)
+        + (uint64_t)model->hdr.n_emits       * sizeof(RPIEmit);
+    if (need > (uint64_t)model->raw_size) {
+        fprintf(stderr, "[RPI] Corrupt/truncated model: sections need %llu "
+                "bytes but file is %zu\n",
+                (unsigned long long)need, model->raw_size);
+        munmap(model->raw, model->raw_size);
+        return -1;
+    }
+
+    if (model->hdr.embed_offset > 0 &&
+        (uint64_t)model->hdr.embed_offset
+            + (uint64_t)model->hdr.vocab_size * sizeof(uint32_t)
+            > (uint64_t)model->raw_size) {
+        fprintf(stderr, "[RPI] Corrupt model: embedding data out of bounds\n");
         munmap(model->raw, model->raw_size);
         return -1;
     }
